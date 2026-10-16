@@ -279,6 +279,17 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
 };
 )";
 
+static const char shader_frag_resolve[] = RMLUI_SHADER_HEADER R"(
+Texture2DMS<float4, 4> g_InputTexture : register(t0);
+
+float4 PSMain(float4 position : SV_Position) : SV_TARGET
+{
+    const int2 pixel = int2(position.xy);
+    return (g_InputTexture.Load(pixel, 0) + g_InputTexture.Load(pixel, 1)
+        + g_InputTexture.Load(pixel, 2) + g_InputTexture.Load(pixel, 3)) * 0.25f;
+};
+)";
+
 static const char shader_frag_color_matrix[] = RMLUI_SHADER_HEADER R"(
 
 Texture2D g_InputTexture : register(t0);
@@ -402,6 +413,61 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
 };
 )";
 
+static const char shader_frag_blur_paired[] = RMLUI_SHADER_BLUR_HEADER R"(
+Texture2D g_InputTexture : register(t0);
+SamplerState g_SamplerLinear : register(s0);
+
+cbuffer SharedConstantBuffer : register(b0)
+{
+    float4x4 m_transform;
+    float2 m_translate;
+    float2 m_texelOffset;
+    float4 m_weights;
+    float2 m_texCoordMin;
+    float2 m_texCoordMax;
+    float4 m_pairedWeightsOffsets;
+};
+
+struct PS_Input
+{
+    float4 position : SV_Position;
+    float2 uv[BLUR_SIZE] : TEXCOORD;
+};
+
+float4 SampleBlur(float2 uv)
+{
+    return g_InputTexture.SampleLevel(g_SamplerLinear, float2(uv.x, 1.0f - uv.y), 0);
+}
+
+float4 PSMain(const PS_Input IN) : SV_TARGET
+{
+    // The vertex shader supplies both axes. The PS texel offset still describes the vertical pass during horizontal blur.
+    const bool interior = all(IN.uv[0] >= m_texCoordMin) && all(IN.uv[0] <= m_texCoordMax)
+        && all(IN.uv[BLUR_SIZE - 1] >= m_texCoordMin) && all(IN.uv[BLUR_SIZE - 1] <= m_texCoordMax);
+    [branch] if (interior)
+    {
+        const float inner_weight = m_pairedWeightsOffsets.x;
+        const float outer_weight = m_pairedWeightsOffsets.y;
+        const float inner_offset = m_pairedWeightsOffsets.z;
+        const float outer_offset = m_pairedWeightsOffsets.w;
+        float4 color = (SampleBlur(lerp(IN.uv[3], IN.uv[2], inner_offset))
+            + SampleBlur(lerp(IN.uv[3], IN.uv[4], inner_offset))) * inner_weight;
+        color += (SampleBlur(lerp(IN.uv[1], IN.uv[0], outer_offset))
+            + SampleBlur(lerp(IN.uv[5], IN.uv[6], outer_offset))) * outer_weight;
+        return color;
+    }
+
+    // A bilinear pair straddling the filter bounds would blend a tap which the reference kernel rejects.
+    float4 color = float4(0.0, 0.0, 0.0, 0.0);
+    for (int i = 0; i < BLUR_SIZE; i++)
+    {
+        float2 in_region = step(m_texCoordMin, IN.uv[i]) * step(IN.uv[i], m_texCoordMax);
+        color += SampleBlur(IN.uv[i]) * in_region.x * in_region.y * m_weights[abs(i - BLUR_NUM_WEIGHTS + 1)];
+    }
+    return color;
+};
+)";
+
 static const char shader_frag_drop_shadow[] = RMLUI_SHADER_HEADER R"(
 Texture2D g_InputTexture : register(t0);
 SamplerState g_SamplerLinear : register(s0);
@@ -438,6 +504,8 @@ enum class ProgramId {
 	BlendMask,
 	Blur,
 	DropShadow,
+	Resolve,
+	BlurPaired,
 	Count,
 };
 enum class VertShaderId {
@@ -551,7 +619,8 @@ struct ProgramData {
 };
 
 // Create the shader, 'shader_type' is either GL_VERTEX_SHADER or GL_FRAGMENT_SHADER.
-static bool CreateShader(ID3DBlob*& out_shader_dxil, ShaderType shader_type, const char* code_string, const size_t code_length)
+static bool CreateShader(ID3DBlob*& out_shader_dxil, ShaderType shader_type, const char* code_string, const size_t code_length,
+	bool optional = false)
 {
 	RMLUI_ASSERT(shader_type == ShaderType::Vertex || shader_type == ShaderType::Fragment);
 
@@ -566,28 +635,32 @@ static bool CreateShader(ID3DBlob*& out_shader_dxil, ShaderType shader_type, con
 
 	HRESULT result = D3DCompile(code_string, code_length, nullptr, nullptr, nullptr, shader_type == ShaderType::Vertex ? "VSMain" : "PSMain",
 		shader_type == ShaderType::Vertex ? "vs_5_0" : "ps_5_0", default_shader_flags, 0, &out_shader_dxil, &p_error_buff);
-	RMLUI_DX_ASSERTMSG(result, "failed to D3DCompile");
-#ifdef RMLUI_DX_DEBUG
+	if (!optional)
+		RMLUI_DX_ASSERTMSG(result, "failed to D3DCompile");
 	if (FAILED(result))
 	{
-		Rml::Log::Message(Rml::Log::Type::LT_ERROR, "failed to compile shader: %s", (char*)p_error_buff->GetBufferPointer());
+		Rml::Log::Message(optional ? Rml::Log::LT_WARNING : Rml::Log::LT_ERROR, "Failed to compile %sDX11 shader: %s",
+			optional ? "optional " : "", p_error_buff ? (const char*)p_error_buff->GetBufferPointer() : "no compiler diagnostics");
+		Dx11CleanupResourceIfCreated(p_error_buff);
+		Dx11CleanupResourceIfCreated(out_shader_dxil);
 		return false;
 	}
-#endif
 
 	Dx11CleanupResourceIfCreated(p_error_buff);
 
 	return true;
 }
 
-static bool CreateProgram(ID3D11Device* p_device, ShaderProgram& out_program, ID3DBlob* vertex_shader, ID3DBlob* fragment_shader)
+static bool CreateProgram(ID3D11Device* p_device, ShaderProgram& out_program, ID3DBlob* vertex_shader, ID3DBlob* fragment_shader,
+	bool optional = false)
 {
 	RMLUI_ASSERT(vertex_shader);
 	RMLUI_ASSERT(fragment_shader);
 
 	HRESULT result =
 		p_device->CreateVertexShader(vertex_shader->GetBufferPointer(), vertex_shader->GetBufferSize(), nullptr, &out_program.vertex_shader);
-	RMLUI_DX_ASSERTMSG(result, "failed to CreateVertexShader");
+	if (!optional)
+		RMLUI_DX_ASSERTMSG(result, "failed to CreateVertexShader");
 	if (FAILED(result))
 	{
 #ifdef RMLUI_DX_DEBUG
@@ -597,7 +670,8 @@ static bool CreateProgram(ID3D11Device* p_device, ShaderProgram& out_program, ID
 	}
 
 	result = p_device->CreatePixelShader(fragment_shader->GetBufferPointer(), fragment_shader->GetBufferSize(), nullptr, &out_program.pixel_shader);
-	RMLUI_DX_ASSERTMSG(result, "failed to CreatePixelShader");
+	if (!optional)
+		RMLUI_DX_ASSERTMSG(result, "failed to CreatePixelShader");
 	if (FAILED(result))
 	{
 #ifdef RMLUI_DX_DEBUG
@@ -795,6 +869,24 @@ static bool CreateShaders(ID3D11Device* p_device, ProgramData& data)
 	return true;
 }
 
+static void CreateOptionalProgram(ID3D11Device* device, ProgramData& data, ProgramId program, VertShaderId vertex,
+	const char* fragment_source, size_t source_size)
+{
+	ID3DBlob* fragment = nullptr;
+	ShaderProgram candidate{};
+	const bool compiled = CreateShader(fragment, ShaderType::Fragment, fragment_source, source_size, true);
+	if (compiled && CreateProgram(device, candidate, data.vert_shaders[vertex], fragment, true))
+		data.programs[program] = candidate;
+	else
+	{
+		if (compiled)
+			Rml::Log::Message(Rml::Log::LT_WARNING, "Could not create optional DX11 program %d; using the reference path.", int(program));
+		Dx11CleanupResourceIfCreated(candidate.vertex_shader);
+		Dx11CleanupResourceIfCreated(candidate.pixel_shader);
+	}
+	Dx11CleanupResourceIfCreated(fragment);
+}
+
 static void DestroyShaders(const ProgramData& data)
 {
 	for (ShaderProgram programs : data.programs)
@@ -946,6 +1038,10 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 	auto mut_program_data = Rml::MakeUnique<Gfx::ProgramData>();
 	if (Gfx::CreateShaders(m_d3d_device, *mut_program_data))
 	{
+		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::Resolve, VertShaderId::Passthrough,
+			shader_frag_resolve, sizeof(shader_frag_resolve));
+		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::BlurPaired, VertShaderId::Blur,
+			shader_frag_blur_paired, sizeof(shader_frag_blur_paired));
 		program_data = std::move(mut_program_data);
 	}
 
@@ -1199,7 +1295,9 @@ void RenderInterface_DX11::BeginFrame()
 	m_render_layers.BeginFrame(m_viewport_width, m_viewport_height);
 	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
 	float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	NotifyDiagnosticStage(DiagnosticStage::Clear, true);
 	m_d3d_context->ClearRenderTargetView(m_render_layers.GetTopLayer().render_target_view, clearColor);
+	NotifyDiagnosticStage(DiagnosticStage::Clear, false);
 
 	UseProgram(ProgramId::None);
 	m_scissor_state = Rml::Rectanglei::MakeInvalid();
@@ -1213,8 +1311,14 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 	const Gfx::RenderTargetData& rt_postprocess = m_render_layers.GetPostprocessPrimary();
 
 	// Resolve MSAA to the post-process framebuffer.
-	if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
+	if (m_diagnostic_counters)
+	{
+		++m_diagnostic_counters->resolves;
+		m_diagnostic_counters->resolve_pixels += uint64_t(rt_active.width) * uint64_t(rt_active.height);
+	}
+	NotifyDiagnosticStage(DiagnosticStage::Resolve, true);
 	m_d3d_context->ResolveSubresource(rt_postprocess.render_target_texture, 0, rt_active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+	NotifyDiagnosticStage(DiagnosticStage::Resolve, false);
 
 	// Draw to bound_render_target (usually the swapchain RTV)
 	m_d3d_context->OMSetRenderTargets(1, &p_render_target_view, nullptr);
@@ -1226,7 +1330,9 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 
 	UseProgram(ProgramId::Passthrough);
 
+	NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 	DrawFullscreenQuad();
+	NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 	m_render_layers.EndFrame();
 
@@ -1745,7 +1851,9 @@ void RenderInterface_DX11::SetViewport(const int width, const int height)
 void RenderInterface_DX11::Clear(ID3D11RenderTargetView* p_render_target_view)
 {
 	float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+	NotifyDiagnosticStage(DiagnosticStage::Clear, true);
 	m_d3d_context->ClearRenderTargetView(p_render_target_view, clearColor);
+	NotifyDiagnosticStage(DiagnosticStage::Clear, false);
 }
 
 void RenderInterface_DX11::RestorePartialRenderState()
@@ -1796,8 +1904,14 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	{
 		if (source.sample_count > 1)
 		{
-			if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
+			if (m_diagnostic_counters)
+			{
+				++m_diagnostic_counters->resolves;
+				m_diagnostic_counters->resolve_pixels += uint64_t(source.width) * uint64_t(source.height);
+			}
+			NotifyDiagnosticStage(DiagnosticStage::Resolve, true);
 			m_d3d_context->ResolveSubresource(target.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+			NotifyDiagnosticStage(DiagnosticStage::Resolve, false);
 		}
 		else
 		{
@@ -1864,7 +1978,9 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 		{{x0, y0}, {}, {u0, v0}}, {{x1, y0}, {}, {u1, v0}},
 		{{x1, y1}, {}, {u1, v1}}, {{x0, y1}, {}, {u0, v1}}
 	};
+	NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 	DrawQuad({vertices, 4});
+	NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 	// Restore even when the quad upload failed. The caller may have had blending disabled.
 	m_d3d_context->PSSetShaderResources(0, 2, null_views);
@@ -1879,12 +1995,59 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	Dx11CleanupResourceIfCreated(original_depth);
 }
 
-void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle)
+void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional)
 {
 	const Gfx::RenderTargetData& source = m_render_layers.GetLayer(layer_handle);
 	const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessPrimary();
 
-	// Blit and resolve MSAA. Any active scissor state will restrict the size of the blit region.
+	// Resolving a small input region avoids reading the whole MSAA layer. Retain full-size targets and pixel coordinates.
+	if (allow_regional && (m_effect_optimizations & EffectOptimizationRegionalResolve) && m_scissor_state.Valid()
+		&& source.sample_count == MsaaSamples && destination.sample_count == 1
+		&& source.width == destination.width && source.height == destination.height
+		&& source.width == m_viewport_width && source.height == m_viewport_height
+		&& source.render_target_shader_resource_view && program_data && program_data->programs[ProgramId::Resolve].pixel_shader)
+	{
+		const Rml::Rectanglei region = Rml::Rectanglei::FromCorners(
+			{Rml::Math::Clamp(m_scissor_state.Left(), 0, source.width), Rml::Math::Clamp(m_scissor_state.Top(), 0, source.height)},
+			{Rml::Math::Clamp(m_scissor_state.Right(), 0, source.width), Rml::Math::Clamp(m_scissor_state.Bottom(), 0, source.height)});
+		const uint64_t pixels = uint64_t(region.Width()) * uint64_t(region.Height());
+		const uint64_t full_pixels = uint64_t(source.width) * uint64_t(source.height);
+		if (pixels > 0 && pixels <= full_pixels / 4)
+		{
+			ID3D11RenderTargetView* original_target = nullptr;
+			ID3D11DepthStencilView* original_depth = nullptr;
+			m_d3d_context->OMGetRenderTargets(1, &original_target, &original_depth);
+			ID3D11BlendState* original_blend = m_current_blend_state;
+			const bool original_blend_enabled = m_current_blend_state_enabled;
+			const Rml::Rectanglei original_scissor = m_scissor_state;
+			ID3D11ShaderResourceView* null_views[2] = {nullptr, nullptr};
+			m_d3d_context->PSSetShaderResources(0, 2, null_views);
+			// Binding the single-sample output first releases the MSAA source from its RTV/DSV slots.
+			Gfx::BindRenderTarget(m_d3d_context, destination);
+			Gfx::BindTexture(m_d3d_context, source);
+			DisableBlend();
+			SetScissor(region);
+			UseProgram(ProgramId::Resolve);
+			NotifyDiagnosticStage(DiagnosticStage::Resolve, true);
+			DrawFullscreenQuad();
+			NotifyDiagnosticStage(DiagnosticStage::Resolve, false);
+			m_d3d_context->PSSetShaderResources(0, 2, null_views);
+			m_d3d_context->OMSetRenderTargets(1, &original_target, original_depth);
+			if (original_blend_enabled) SetBlendState(original_blend);
+			else DisableBlend();
+			SetScissor(original_scissor);
+			Dx11CleanupResourceIfCreated(original_target);
+			Dx11CleanupResourceIfCreated(original_depth);
+			if (m_diagnostic_counters)
+			{
+				++m_diagnostic_counters->regional_resolves;
+				m_diagnostic_counters->resolve_pixels += pixels;
+			}
+			return;
+		}
+	}
+
+	// Hardware ResolveSubresource resolves the entire subresource, independently of the active scissor.
 	BlitRenderTarget(source, destination, 0, 0, source.width, source.height, 0, 0, destination.width, destination.height);
 }
 
@@ -1895,7 +2058,9 @@ Rml::LayerHandle RenderInterface_DX11::PushLayer()
 
 	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
 	float colors[4] = {0, 0, 0, 0};
+	NotifyDiagnosticStage(DiagnosticStage::Clear, true);
 	m_d3d_context->ClearRenderTargetView(m_render_layers.GetTopLayer().render_target_view, colors);
+	NotifyDiagnosticStage(DiagnosticStage::Clear, false);
 
 	return layer_handle;
 }
@@ -1903,16 +2068,38 @@ Rml::LayerHandle RenderInterface_DX11::PushLayer()
 void RenderInterface_DX11::CompositeLayers(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle, Rml::BlendMode blend_mode,
 	Rml::Span<const Rml::CompiledFilterHandle> filters)
 {
+	CompositeLayersInternal(source_handle, destination_handle, blend_mode, filters, m_scissor_state, false);
+}
+
+bool RenderInterface_DX11::SupportsCompositeLayersWithInputBounds() const
+{
+	return (m_effect_optimizations & EffectOptimizationDirectBackdrop) != 0;
+}
+
+void RenderInterface_DX11::CompositeLayersWithInputBounds(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle,
+	Rml::BlendMode blend_mode, Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_bounds)
+{
+	CompositeLayersInternal(source_handle, destination_handle, blend_mode, filters, input_bounds, true);
+}
+
+void RenderInterface_DX11::CompositeLayersInternal(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle,
+	Rml::BlendMode blend_mode, Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_bounds, bool direct_backdrop)
+{
 	if (m_diagnostic_counters) ++m_diagnostic_counters->composites;
+	if (m_diagnostic_counters && direct_backdrop) ++m_diagnostic_counters->direct_backdrops;
 	using Rml::BlendMode;
+	const Rml::Rectanglei output_bounds = m_scissor_state;
+	// Filtering needs the halo around the output, while the current stencil belongs only to the destination.
+	SetScissor(input_bounds);
 
 	// Blit source layer to postprocessing buffer. Do this regardless of whether we actually have any filters to be
 	// applied, because we need to resolve the multi-sampled framebuffer in any case.
 	// @performance If we have BlendMode::Replace and no filters or mask then we can just blit directly to the destination.
-	BlitLayerToPostprocessPrimary(source_handle);
+	BlitLayerToPostprocessPrimary(source_handle, true);
 
 	// Render the filters, the PostprocessPrimary framebuffer is used for both input and output.
 	RenderFilters(filters);
+	SetScissor(output_bounds);
 
 	// Render to the destination layer.
 	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetLayer(destination_handle));
@@ -1923,7 +2110,9 @@ void RenderInterface_DX11::CompositeLayers(Rml::LayerHandle source_handle, Rml::
 	if (blend_mode == BlendMode::Replace)
 		DisableBlend();
 
+	NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 	DrawFullscreenQuad();
+	NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 	if (blend_mode == BlendMode::Replace)
 		SetBlendState(m_current_blend_state);
@@ -1981,7 +2170,9 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 
 	// Copy the blitted content from the destination to the final texture
 	if (m_diagnostic_counters) ++m_diagnostic_counters->copies;
+	NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 	m_d3d_context->CopySubresourceRegion(texture_resource, 0, 0, 0, 0, destination.render_target_texture, 0, &copy_box);
+	NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 	// Restore state and free memory
 	SetScissor(bounds);
@@ -2026,7 +2217,9 @@ Rml::CompiledFilterHandle RenderInterface_DX11::SaveLayerAsMaskImage()
 	ID3D11BlendState* blend_state_backup = m_current_blend_state;
 	DisableBlend();
 
+	NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 	DrawFullscreenQuad();
+	NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 	// Unbind resources
 	m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
@@ -2460,7 +2653,9 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 		Gfx::BindTexture(m_d3d_context, from_source ? source_destination : temp);
 		SetScissor(scissor, true);
 
+		NotifyDiagnosticStage(DiagnosticStage::Downscale, true);
 		DrawFullscreenQuad({}, uv_scaling);
+		NotifyDiagnosticStage(DiagnosticStage::Downscale, false);
 	}
 
 	d3dviewport.TopLeftX = 0;
@@ -2477,11 +2672,15 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	{
 		Gfx::BindRenderTarget(m_d3d_context, temp);
 		Gfx::BindTexture(m_d3d_context, source_destination);
+		NotifyDiagnosticStage(DiagnosticStage::Downscale, true);
 		DrawFullscreenQuad();
+		NotifyDiagnosticStage(DiagnosticStage::Downscale, false);
 	}
 
 	// Set up uniforms.
-	UseProgram(ProgramId::Blur);
+	const bool paired = (m_effect_optimizations & EffectOptimizationPairedGaussian)
+		&& program_data->programs[ProgramId::BlurPaired].pixel_shader;
+	UseProgram(paired ? ProgramId::BlurPaired : ProgramId::Blur);
 	D3D11_MAPPED_SUBRESOURCE mappedResource{};
 	// Lock the constant buffer so it can be written to.
 	HRESULT result = m_d3d_context->Map(m_shader_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
@@ -2495,6 +2694,15 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	ShaderCbuffer* dataPtr = (ShaderCbuffer*)mappedResource.pData;
 
 	SetBlurWeights(dataPtr->blur.weights, sigma);
+	if (paired)
+	{
+		// Split the centre weight between the two inner pairs. Ratios are computed once per blur, not per pixel.
+		const Rml::Vector4f weights = dataPtr->blur.weights;
+		const float inner_weight = weights.x * 0.5f + weights.y;
+		const float outer_weight = weights.z + weights.w;
+		dataPtr->blur.paired_weights_offsets = {inner_weight, outer_weight, weights.y / inner_weight,
+			outer_weight > 0.f ? weights.w / outer_weight : 0.f};
+	}
 	SetTexCoordLimits(dataPtr->blur.texcoord_min, dataPtr->blur.texcoord_max, scissor, {source_destination.width, source_destination.height});
 
 	Rml::Vector2f texel_offset = Rml::Vector2f(0.f, 1.f) * (1.0f / float(temp.height));
@@ -2509,7 +2717,9 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	// Blur render pass - vertical.
 	Gfx::BindRenderTarget(m_d3d_context, source_destination);
 	Gfx::BindTexture(m_d3d_context, temp);
+	NotifyDiagnosticStage(DiagnosticStage::Gaussian, true);
 	DrawFullscreenQuad();
+	NotifyDiagnosticStage(DiagnosticStage::Gaussian, false);
 
 	// Blur render pass - horizontal.
 	Gfx::BindRenderTarget(m_d3d_context, temp);
@@ -2538,7 +2748,9 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	rect_scissor.bottom = y_max;
 
 	FLOAT clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	NotifyDiagnosticStage(DiagnosticStage::Clear, true);
 	m_d3d_context->ClearView(temp.render_target_view, clear_color, &rect_scissor, 1);
+	NotifyDiagnosticStage(DiagnosticStage::Clear, false);
 	SetScissor(scissor, true);
 
 	// Update texel offset for upscale pass
@@ -2558,7 +2770,9 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	m_d3d_context->Unmap(m_blur_cbuffer, 0);
 	m_d3d_context->VSSetConstantBuffers(0, 1, &m_blur_cbuffer);
 
+	NotifyDiagnosticStage(DiagnosticStage::Gaussian, true);
 	RenderGeometry(m_fullscreen_quad_geometry, {}, RenderInterface_DX11::TexturePostprocessNoBinding);
+	NotifyDiagnosticStage(DiagnosticStage::Gaussian, false);
 
 	// Blit the blurred image to the scissor region with upscaling.
 	Rml::Rectanglei window_flipped_twice = VerticallyFlipped(window_flipped, m_viewport_height);
@@ -2620,7 +2834,9 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			Gfx::BindTexture(m_d3d_context, source);
 			m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
+			NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 			DrawFullscreenQuad();
+			NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 			m_render_layers.SwapPostprocessPrimarySecondary();
 			SetBlendState(m_blend_state_enable);
@@ -2681,7 +2897,9 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			m_cbuffer_dirty = true;
 
 			const Rml::Vector2f uv_offset = filter.offset / Rml::Vector2f(-(float)m_viewport_width, (float)m_viewport_height);
+			NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 			DrawFullscreenQuad(uv_offset);
+			NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 			if (filter.sigma >= 0.5f)
 			{
@@ -2693,7 +2911,9 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			Gfx::BindRenderTarget(m_d3d_context, secondary);
 			Gfx::BindTexture(m_d3d_context, primary);
 			SetBlendState(blend_state_backup);
+			NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 			DrawFullscreenQuad();
+			NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 			m_render_layers.SwapPostprocessPrimarySecondary();
 
@@ -2742,7 +2962,9 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			m_d3d_context->PSSetConstantBuffers(1, 1, &m_color_matrix_cbuffer);
 
+			NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 			DrawFullscreenQuad();
+			NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 			// Unbind cbuffer
 			ID3D11Buffer* null_cbuffer = nullptr;
@@ -2772,7 +2994,9 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			Gfx::BindTexture(m_d3d_context, source, 0);
 			Gfx::BindTexture(m_d3d_context, blend_mask, 1);
 
+			NotifyDiagnosticStage(DiagnosticStage::Composite, true);
 			DrawFullscreenQuad();
+			NotifyDiagnosticStage(DiagnosticStage::Composite, false);
 
 			m_render_layers.SwapPostprocessPrimarySecondary();
 			SetBlendState(blend_state_backup);
@@ -2887,7 +3111,9 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 		// Clear stencil buffer
 		Rml::LayerHandle layer_handle = m_render_layers.GetTopLayerHandle();
 		const Gfx::RenderTargetData& rtData = m_render_layers.GetLayer(layer_handle);
+		NotifyDiagnosticStage(DiagnosticStage::Clear, true);
 		m_d3d_context->ClearDepthStencilView(rtData.depth_stencil_view, D3D11_CLEAR_STENCIL, 1.0f, 0);
+		NotifyDiagnosticStage(DiagnosticStage::Clear, false);
 	}
 
 	RenderGeometry(geometry, translation, {});

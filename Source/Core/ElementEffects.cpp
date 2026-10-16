@@ -257,26 +257,31 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 		{
 			const LayerHandle backdrop_destination_layer = render_manager->GetTopLayer();
 
-			// @performance We strictly only need this temporary buffer when having to read from outside the element
-			// boundaries, which currently only applies to blur and drop-shadow. Alternatively, we could avoid this
-			// completely if we introduced a render interface API concept of different input and output clipping. That
-			// is, we set a large input scissor to cover all input data, which can be used e.g. during blurring, and use
-			// our small border-area-only clipping region for the composite layers output.
-			ApplyScissorRegionForBackdrop();
-			render_manager->PushLayer();
-			const LayerHandle backdrop_temp_layer = render_manager->GetTopLayer();
-
 			FilterHandleList filter_handles;
 			for (auto& filter : backdrop_filters)
 				filter.compiled.AddHandleTo(filter_handles);
 
-			// Render the backdrop filters in the extended scissor region including any ink overflow.
-			render_manager->CompositeLayers(backdrop_source_layer, backdrop_temp_layer, BlendMode::Blend, filter_handles);
-
-			// Then composite the filter output to our destination while applying our clipping region, including any border-radius.
-			ApplyClippingRegion(PropertyId::BackdropFilter);
-			render_manager->CompositeLayers(backdrop_temp_layer, backdrop_destination_layer, BlendMode::Blend, {});
-			render_manager->PopLayer();
+			// An existing input mask needs the intermediate layer to preserve its effect before output clipping changes.
+			const bool direct_backdrop = render_manager->SupportsCompositeLayersWithInputBounds() &&
+				render_manager->GetState().clip_mask_list.empty();
+			ApplyScissorRegionForBackdrop();
+			if (direct_backdrop)
+			{
+				const Rectanglei input_bounds = render_manager->GetScissorRegion();
+				ApplyClippingRegion(PropertyId::BackdropFilter);
+				render_manager->CompositeLayersWithInputBounds(backdrop_source_layer, backdrop_destination_layer, BlendMode::Blend,
+					filter_handles, input_bounds);
+			}
+			else
+			{
+				render_manager->PushLayer();
+				const LayerHandle backdrop_temp_layer = render_manager->GetTopLayer();
+				// Render the filters over their input bounds, then apply the output border and clip mask.
+				render_manager->CompositeLayers(backdrop_source_layer, backdrop_temp_layer, BlendMode::Blend, filter_handles);
+				ApplyClippingRegion(PropertyId::BackdropFilter);
+				render_manager->CompositeLayers(backdrop_temp_layer, backdrop_destination_layer, BlendMode::Blend, {});
+				render_manager->PopLayer();
+			}
 			render_manager->SetScissorRegion(initial_scissor_region);
 		}
 	}

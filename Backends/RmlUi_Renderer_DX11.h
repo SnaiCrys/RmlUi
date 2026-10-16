@@ -45,10 +45,23 @@ public:
 	static constexpr int MsaaSamples = 4;
 	// Diagnostic reference retains the copy and transient-geometry paths, with the same correctness fixes.
 	void SetOptimizationsEnabled(bool enabled) { m_optimizations_enabled = enabled; }
+	static constexpr uint32_t EffectOptimizationDirectBackdrop = 1u;
+	static constexpr uint32_t EffectOptimizationRegionalResolve = 2u;
+	static constexpr uint32_t EffectOptimizationPairedGaussian = 4u;
+	static constexpr uint32_t AllEffectOptimizations = 7u;
+	void SetEffectOptimizations(uint32_t mask) { m_effect_optimizations = mask & AllEffectOptimizations; }
 	struct DiagnosticCounters {
 		uint64_t geometry_buffers = 0, resolves = 0, copies = 0, draws = 0, layers = 0, composites = 0, blurs = 0;
+		uint64_t regional_resolves = 0, direct_backdrops = 0, resolve_pixels = 0;
 	};
 	void SetDiagnosticCounters(DiagnosticCounters* counters) { m_diagnostic_counters = counters; }
+	enum class DiagnosticStage { Clear, Resolve, Downscale, Gaussian, Composite };
+	using DiagnosticCallback = void (*)(void* user, DiagnosticStage stage, bool begin);
+	void SetDiagnosticCallback(DiagnosticCallback callback, void* user = nullptr)
+	{
+		m_diagnostic_callback = callback;
+		m_diagnostic_user = user;
+	}
 
 	// -- Inherited from Rml::RenderInterface --
 
@@ -71,6 +84,9 @@ public:
 	Rml::LayerHandle PushLayer() override;
 	void CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
 		Rml::Span<const Rml::CompiledFilterHandle> filters) override;
+	bool SupportsCompositeLayersWithInputBounds() const override;
+	void CompositeLayersWithInputBounds(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
+		Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_bounds) override;
 	void PopLayer() override;
 
 	Rml::TextureHandle SaveLayerAsTexture() override;
@@ -95,6 +111,14 @@ public:
 private:
 	DiagnosticCounters* m_diagnostic_counters = nullptr;
 	bool m_optimizations_enabled = true;
+	uint32_t m_effect_optimizations = AllEffectOptimizations;
+	DiagnosticCallback m_diagnostic_callback = nullptr;
+	void* m_diagnostic_user = nullptr;
+	void NotifyDiagnosticStage(DiagnosticStage stage, bool begin) const
+	{
+		if (m_diagnostic_callback)
+			m_diagnostic_callback(m_diagnostic_user, stage, begin);
+	}
 	// Changes blend state if necessary
 	void SetBlendState(ID3D11BlendState* blend_state);
 	void DisableBlend();
@@ -105,8 +129,10 @@ private:
 	// Coordinates are in pixels.
 	void BlitRenderTarget(const Gfx::RenderTargetData& source, const Gfx::RenderTargetData& dest, int srcX0, int srcY0, int srcX1, int srcY1,
 		int dstX0, int dstY0, int dstX1, int dstY1);
-	void BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle);
+	void BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional = false);
 	void RenderFilters(Rml::Span<const Rml::CompiledFilterHandle> filter_handles);
+	void CompositeLayersInternal(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
+		Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_bounds, bool direct_backdrop);
 
 	void SetScissor(Rml::Rectanglei region, bool vertically_flip = false);
 
@@ -219,6 +245,7 @@ private:
 			Rml::Vector4f weights;
 			Rml::Vector2f texcoord_min;
 			Rml::Vector2f texcoord_max;
+			Rml::Vector4f paired_weights_offsets;
 		} blur;
 		struct DropShadow {
 			Rml::Vector2f texcoord_min;

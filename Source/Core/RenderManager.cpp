@@ -307,6 +307,20 @@ void RenderManager::CompositeLayers(LayerHandle source, LayerHandle destination,
 	render_interface->CompositeLayers(source, destination, blend_mode, filters);
 }
 
+bool RenderManager::SupportsCompositeLayersWithInputBounds() const
+{
+	return render_interface->SupportsCompositeLayersWithInputBounds();
+}
+
+void RenderManager::CompositeLayersWithInputBounds(LayerHandle source, LayerHandle destination, BlendMode blend_mode,
+	Span<const CompiledFilterHandle> filters, Rectanglei input_bounds)
+{
+	RMLUI_ASSERT(source == 0 || std::find(render_stack.begin(), render_stack.end(), source) != render_stack.end());
+	RMLUI_ASSERT(destination == 0 || std::find(render_stack.begin(), render_stack.end(), destination) != render_stack.end());
+	RMLUI_ASSERT(SupportsCompositeLayersWithInputBounds());
+	render_interface->CompositeLayersWithInputBounds(source, destination, blend_mode, filters, input_bounds);
+}
+
 void RenderManager::PopLayer()
 {
 	RMLUI_ASSERT(!render_stack.empty());

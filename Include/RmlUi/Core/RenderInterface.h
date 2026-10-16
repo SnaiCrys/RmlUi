@@ -103,6 +103,12 @@ public:
 	/// @param[in] filters A list of compiled filters which should be applied before blending.
 	/// @note Source and destination can reference the same layer.
 	virtual void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters);
+	/// Whether the renderer supports separate input bounds and output clipping when compositing layers.
+	virtual bool SupportsCompositeLayersWithInputBounds() const;
+	/// Composite layers using input_bounds for filter reads and the current scissor and clip mask for output.
+	/// @note Called only when SupportsCompositeLayersWithInputBounds() returns true. The input has no clip mask.
+	virtual void CompositeLayersWithInputBounds(LayerHandle source, LayerHandle destination, BlendMode blend_mode,
+		Span<const CompiledFilterHandle> filters, Rectanglei input_bounds);
 	/// Called by RmlUi when it wants to pop the render layer stack, setting the new top layer as the render target.
 	virtual void PopLayer();
 

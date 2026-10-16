@@ -32,6 +32,15 @@ void RenderInterface::CompositeLayers(LayerHandle /*source*/, LayerHandle /*dest
 	Span<const CompiledFilterHandle> /*filters*/)
 {}
 
+bool RenderInterface::SupportsCompositeLayersWithInputBounds() const
+{
+	return false;
+}
+
+void RenderInterface::CompositeLayersWithInputBounds(LayerHandle /*source*/, LayerHandle /*destination*/, BlendMode /*blend_mode*/,
+	Span<const CompiledFilterHandle> /*filters*/, Rectanglei /*input_bounds*/)
+{}
+
 void RenderInterface::PopLayer() {}
 
 TextureHandle RenderInterface::SaveLayerAsTexture()

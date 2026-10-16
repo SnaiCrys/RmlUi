@@ -77,6 +77,9 @@ public:
 
 	LayerHandle PushLayer();
 	void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters);
+	bool SupportsCompositeLayersWithInputBounds() const;
+	void CompositeLayersWithInputBounds(LayerHandle source, LayerHandle destination, BlendMode blend_mode,
+		Span<const CompiledFilterHandle> filters, Rectanglei input_bounds);
 	void PopLayer();
 
 	LayerHandle GetTopLayer() const;
