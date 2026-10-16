@@ -20,10 +20,6 @@
 	#define RMLUI_DX_ASSERTMSG(statement, msg) static_cast<void>(statement)
 #endif
 
-// Allow the user to override the number of MSAA samples
-#ifndef NUM_MSAA_SAMPLES
-	#define NUM_MSAA_SAMPLES 2
-#endif
 
 enum class ProgramId;
 class RenderLayerStack;
@@ -46,10 +42,11 @@ public:
 
 	void SetViewport(int width, int height);
 	void RestorePartialRenderState();
-	// Change samples only outside BeginFrame/EndFrame; existing geometry remains valid.
-	bool SetMsaaSamples(int samples);
+	static constexpr int MsaaSamples = 4;
+	// Diagnostic reference retains the copy and transient-geometry paths, with the same correctness fixes.
+	void SetOptimizationsEnabled(bool enabled) { m_optimizations_enabled = enabled; }
 	struct DiagnosticCounters {
-		uint64_t geometry_buffers = 0, resolves = 0, draws = 0, layers = 0, composites = 0, blurs = 0;
+		uint64_t geometry_buffers = 0, resolves = 0, copies = 0, draws = 0, layers = 0, composites = 0, blurs = 0;
 	};
 	void SetDiagnosticCounters(DiagnosticCounters* counters) { m_diagnostic_counters = counters; }
 
@@ -97,6 +94,7 @@ public:
 
 private:
 	DiagnosticCounters* m_diagnostic_counters = nullptr;
+	bool m_optimizations_enabled = true;
 	// Changes blend state if necessary
 	void SetBlendState(ID3D11BlendState* blend_state);
 	void DisableBlend();
@@ -114,6 +112,7 @@ private:
 
 	void DrawFullscreenQuad();
 	void DrawFullscreenQuad(Rml::Vector2f uv_offset, Rml::Vector2f uv_scaling = Rml::Vector2f(1.f));
+	void DrawQuad(Rml::Span<const Rml::Vertex> vertices);
 
 	void RenderBlur(float sigma, const Gfx::RenderTargetData& source_destination, const Gfx::RenderTargetData& temp, Rml::Rectanglei window_flipped);
 
@@ -141,6 +140,7 @@ private:
 	ID3D11Buffer* m_drop_shadow_cbuffer = nullptr;
 	bool m_cbuffer_dirty = true;
 	ID3D11SamplerState* m_sampler_state = nullptr;
+	ID3D11SamplerState* m_postprocess_sampler_state = nullptr;
 
 	// Viewport dimensions
 	int m_viewport_width = 0;
@@ -237,6 +237,7 @@ private:
 #pragma pack()
 
 	Rml::CompiledGeometryHandle m_fullscreen_quad_geometry = 0;
+	DX11_GeometryData m_dynamic_quad_geometry;
 
 	/*
 	    Manages render targets, including the layer stack and postprocessing render targets.
@@ -253,7 +254,6 @@ private:
 		~RenderLayerStack();
 
 		void SetD3DResources(ID3D11Device* device);
-		void SetMsaaSamples(int samples);
 
 		// Push a new layer. All references to previously retrieved layers are invalidated.
 		Rml::LayerHandle PushLayer();
@@ -281,7 +281,6 @@ private:
 		const Gfx::RenderTargetData& EnsureRenderTargetPostprocess(int index);
 
 		int m_width = 0, m_height = 0;
-		int m_samples;
 
 		// The number of active layers is manually tracked since we re-use the render targets stored in the fb_layers stack.
 		int m_layers_size = 0;

@@ -611,6 +611,7 @@ static bool CreateProgram(ID3D11Device* p_device, ShaderProgram& out_program, ID
 
 struct RenderTargetData {
 	int width = 0, height = 0;
+	UINT sample_count = 1;
 	ID3D11RenderTargetView* render_target_view = nullptr;                   // To write to colour attachment buffer
 	ID3D11DepthStencilView* depth_stencil_view = nullptr;                   // To write to stencil buffer
 	ID3D11Texture2D* render_target_texture = nullptr;                       // For MSAA resolve
@@ -649,7 +650,7 @@ static bool CreateRenderTarget(ID3D11Device* p_device, RenderTargetData& out_rt,
 
 	D3D11_RENDER_TARGET_VIEW_DESC render_target_view_desc = {};
 	render_target_view_desc.Format = texture_desc.Format;
-	render_target_view_desc.ViewDimension = samples > 0 ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
+	render_target_view_desc.ViewDimension = samples > 1 ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
 	render_target_view_desc.Texture2D.MipSlice = 0;
 
 	ID3D11RenderTargetView* render_target_view = nullptr;
@@ -663,7 +664,7 @@ static bool CreateRenderTarget(ID3D11Device* p_device, RenderTargetData& out_rt,
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC render_target_shader_resource_view_desc = {};
 	render_target_shader_resource_view_desc.Format = texture_desc.Format;
-	render_target_shader_resource_view_desc.ViewDimension = samples > 0 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+	render_target_shader_resource_view_desc.ViewDimension = samples > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
 	render_target_shader_resource_view_desc.Texture2D.MostDetailedMip = 0;
 	render_target_shader_resource_view_desc.Texture2D.MipLevels = 1;
 
@@ -733,6 +734,7 @@ static bool CreateRenderTarget(ID3D11Device* p_device, RenderTargetData& out_rt,
 	out_rt = {};
 	out_rt.width = width;
 	out_rt.height = height;
+	out_rt.sample_count = texture_desc.SampleDesc.Count;
 	out_rt.render_target_view = render_target_view;
 	out_rt.render_target_texture = rt_texture;
 	out_rt.render_target_shader_resource_view = render_target_shader_resource_view;
@@ -830,6 +832,22 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 	Rml::MeshUtilities::GenerateQuad(mesh, Rml::Vector2f(-1), Rml::Vector2f(2), {});
 	m_fullscreen_quad_geometry = RenderInterface_DX11::CompileGeometry(mesh.vertices, mesh.indices);
 
+	D3D11_BUFFER_DESC quad_desc{};
+	quad_desc.ByteWidth = 4 * sizeof(Rml::Vertex);
+	quad_desc.Usage = D3D11_USAGE_DYNAMIC;
+	quad_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	quad_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	if (m_fullscreen_quad_geometry && SUCCEEDED(m_d3d_device->CreateBuffer(&quad_desc, nullptr, &m_dynamic_quad_geometry.vertex_buffer)))
+	{
+		const auto* fullscreen = reinterpret_cast<const DX11_GeometryData*>(m_fullscreen_quad_geometry);
+		m_dynamic_quad_geometry.index_buffer = fullscreen->index_buffer;
+		m_dynamic_quad_geometry.index_buffer->AddRef();
+		m_dynamic_quad_geometry.index_count = fullscreen->index_count;
+	}
+	else
+		Rml::Log::Message(Rml::Log::LT_ERROR, "Failed to create the dynamic quad buffer");
+
+
 	if (!m_blend_state_enable)
 	{
 		// RmlUi serves vertex colors and textures with premultiplied alpha, set the blend mode accordingly.
@@ -898,8 +916,8 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		rasterizerDesc.DepthBiasClamp = D3D11_DEFAULT_DEPTH_BIAS_CLAMP;
 		rasterizerDesc.DepthClipEnable = false;
 		rasterizerDesc.ScissorEnable = true;
-		rasterizerDesc.MultisampleEnable = NUM_MSAA_SAMPLES > 1;
-		rasterizerDesc.AntialiasedLineEnable = NUM_MSAA_SAMPLES > 1;
+		rasterizerDesc.MultisampleEnable = MsaaSamples > 1;
+		rasterizerDesc.AntialiasedLineEnable = MsaaSamples > 1;
 
 		HRESULT result = m_d3d_device->CreateRasterizerState(&rasterizerDesc, &m_rasterizer_state_scissor_enabled);
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateRasterizerState");
@@ -1033,6 +1051,14 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		{
 			return;
 		}
+		// Framebuffer filtering must not wrap into unrelated pixels at the opposite edge.
+		samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+		samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+		samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+		result = m_d3d_device->CreateSamplerState(&samplerDesc, &m_postprocess_sampler_state);
+		RMLUI_DX_ASSERTMSG(result, "failed to CreateSamplerState for postprocessing");
+		if (FAILED(result))
+			return;
 	}
 
 	// Create depth stencil states
@@ -1083,6 +1109,8 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 
 RenderInterface_DX11::~RenderInterface_DX11()
 {
+	Dx11CleanupResourceIfCreated(m_dynamic_quad_geometry.vertex_buffer);
+	Dx11CleanupResourceIfCreated(m_dynamic_quad_geometry.index_buffer);
 	if (m_fullscreen_quad_geometry)
 	{
 		RenderInterface_DX11::ReleaseGeometry(m_fullscreen_quad_geometry);
@@ -1097,6 +1125,7 @@ RenderInterface_DX11::~RenderInterface_DX11()
 
 	// Cleans up all general resources
 	Dx11CleanupResourceIfCreated(m_sampler_state);
+	Dx11CleanupResourceIfCreated(m_postprocess_sampler_state);
 	Dx11CleanupResourceIfCreated(m_blend_state_enable);
 	Dx11CleanupResourceIfCreated(m_blend_state_color_filter);
 	Dx11CleanupResourceIfCreated(m_blend_state_disable_color);
@@ -1176,17 +1205,6 @@ void RenderInterface_DX11::BeginFrame()
 	m_scissor_state = Rml::Rectanglei::MakeInvalid();
 }
 
-bool RenderInterface_DX11::SetMsaaSamples(int samples)
-{
-	if (samples != 2 && samples != 4)
-		return false;
-	UINT levels = 0;
-	if (FAILED(m_d3d_device->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, samples, &levels)) || !levels)
-		return false;
-	m_render_layers.SetMsaaSamples(samples);
-	return true;
-}
-
 void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view)
 {
 	RMLUI_ASSERTMSG(p_render_target_view, "p_render_target_view cannot be nullptr!");
@@ -1204,6 +1222,7 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 	// Assuming we have an opaque background, we can just write to it with the premultiplied alpha blend mode and we'll get the correct result.
 	// Instead, if we had a transparent destination that didn't use premultiplied alpha, we would need to perform a manual un-premultiplication step.
 	Gfx::BindTexture(m_d3d_context, rt_postprocess);
+	m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
 	UseProgram(ProgramId::Passthrough);
 
@@ -1605,18 +1624,52 @@ void RenderInterface_DX11::DrawFullscreenQuad()
 	RenderGeometry(m_fullscreen_quad_geometry, {}, RenderInterface_DX11::TexturePostprocess);
 }
 
+void RenderInterface_DX11::DrawQuad(Rml::Span<const Rml::Vertex> vertices)
+{
+	RMLUI_ASSERT(vertices.size() == 4);
+	auto draw_transient = [&]()
+	{
+		const int indices[] = {0, 3, 1, 1, 3, 2};
+		const auto geometry = CompileGeometry(vertices, {indices, 6});
+		if (geometry)
+		{
+			RenderGeometry(geometry, {}, TexturePostprocess);
+			ReleaseGeometry(geometry);
+		}
+	};
+	if (!m_optimizations_enabled || !m_dynamic_quad_geometry.vertex_buffer)
+	{
+		draw_transient();
+		return;
+	}
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	const HRESULT result = m_d3d_context->Map(m_dynamic_quad_geometry.vertex_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (FAILED(result))
+	{
+		Rml::Log::Message(Rml::Log::LT_ERROR, "Failed to update the dynamic quad buffer (%d)", result);
+		draw_transient();
+		return;
+	}
+	// DISCARD gives queued draws their own backing storage; one quad cannot overwrite an earlier draw.
+	memcpy(mapped.pData, vertices.data(), 4 * sizeof(Rml::Vertex));
+	m_d3d_context->Unmap(m_dynamic_quad_geometry.vertex_buffer, 0);
+	RenderGeometry(reinterpret_cast<Rml::CompiledGeometryHandle>(&m_dynamic_quad_geometry), {}, TexturePostprocess);
+}
+
 void RenderInterface_DX11::DrawFullscreenQuad(Rml::Vector2f uv_offset, Rml::Vector2f uv_scaling)
 {
-	Rml::Mesh mesh;
-	Rml::MeshUtilities::GenerateQuad(mesh, Rml::Vector2f(-1), Rml::Vector2f(2), {});
-	if (uv_offset != Rml::Vector2f() || uv_scaling != Rml::Vector2f(1.f))
+	if (m_optimizations_enabled && uv_offset == Rml::Vector2f() && uv_scaling == Rml::Vector2f(1.f))
 	{
-		for (Rml::Vertex& vertex : mesh.vertices)
-			vertex.tex_coord = (vertex.tex_coord * uv_scaling) + uv_offset;
+		DrawFullscreenQuad();
+		return;
 	}
-	const Rml::CompiledGeometryHandle geometry = CompileGeometry(mesh.vertices, mesh.indices);
-	RenderGeometry(geometry, {}, RenderInterface_DX11::TexturePostprocess);
-	ReleaseGeometry(geometry);
+	Rml::Vertex vertices[4] = {
+		{{-1.f, -1.f}, {}, {0.f, 0.f}}, {{1.f, -1.f}, {}, {1.f, 0.f}},
+		{{1.f, 1.f}, {}, {1.f, 1.f}}, {{-1.f, 1.f}, {}, {0.f, 1.f}}
+	};
+	for (Rml::Vertex& vertex : vertices)
+		vertex.tex_coord = vertex.tex_coord * uv_scaling + uv_offset;
+	DrawQuad({vertices, 4});
 }
 
 /// Flip vertical axis of the rectangle, and move its origin to the vertically opposite side of the viewport.
@@ -1733,127 +1786,97 @@ void RenderInterface_DX11::SetTransform(const Rml::Matrix4f* new_transform)
 void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source, const Gfx::RenderTargetData& dest, int srcX0, int srcY0, int srcX1,
 	int srcY1, int dstX0, int dstY0, int dstX1, int dstY1)
 {
-	int src_width = srcX1 - srcX0;
-	int src_height = srcY1 - srcY0;
-	int dest_width = dstX1 - dstX0;
-	int dest_height = dstY1 - dstY0;
+	const int dest_width = dstX1 - dstX0;
+	const int dest_height = dstY1 - dstY0;
+	const bool full_copy = srcX0 == 0 && srcY0 == 0 && dstX0 == 0 && dstY0 == 0
+		&& srcX1 == source.width && srcY1 == source.height && dstX1 == dest.width && dstY1 == dest.height
+		&& source.width == dest.width && source.height == dest.height && dest.sample_count == 1;
 
-	bool is_flipped = src_width < 0 || src_height < 0 || dest_width < 0 || dest_height < 0;
-	bool is_stretched = src_width != dest_width || src_height != dest_height;
-	bool is_full_copy = src_width == dest_width && src_height == dest_height && srcX0 == 0 && srcY0 == 0 && dstX0 == 0 && dstY0 == 0;
-
-	if (is_flipped || is_stretched || !is_full_copy)
+	auto copy_or_resolve = [&](const Gfx::RenderTargetData& target)
 	{
-		// Full draw call. Slow path because no equivalent in DX11
+		if (source.sample_count > 1)
+		{
+			if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
+			m_d3d_context->ResolveSubresource(target.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+		}
+		else
+		{
+			if (m_diagnostic_counters) ++m_diagnostic_counters->copies;
+			m_d3d_context->CopyResource(target.render_target_texture, source.render_target_texture);
+		}
+	};
 
-		// Cache current state
-		ID3D11RenderTargetView* original_render_target_view = nullptr;
-		ID3D11DepthStencilView* original_depth_stencil_view = nullptr;
-		m_d3d_context->OMGetRenderTargets(1, &original_render_target_view, &original_depth_stencil_view);
-
-		// Bind temporary as the render target
-		const Gfx::RenderTargetData& temporary_rt = m_render_layers.GetTemporary();
-
-		// Unbind existing textures to prevent warning spam
-		ID3D11ShaderResourceView* null_shader_resource_views[2] = {nullptr, nullptr};
-		m_d3d_context->PSSetShaderResources(0, 2, null_shader_resource_views);
-
-		// Disable blending
-		DisableBlend();
-
-		// Resolve from source to the temporary first
-		if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
-		m_d3d_context->ResolveSubresource(temporary_rt.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
-
-		// Bind destination as our final render texture
-		Gfx::BindRenderTarget(m_d3d_context, dest);
-
-		D3D11_VIEWPORT d3dviewport{};
-		d3dviewport.TopLeftX = 0;
-		d3dviewport.TopLeftY = 0;
-		d3dviewport.Width = (float)dest.width;
-		d3dviewport.Height = (float)dest.height;
-		d3dviewport.MinDepth = 0.0f;
-		d3dviewport.MaxDepth = 1.0f;
-		m_d3d_context->RSSetViewports(1, &d3dviewport);
-
-		// Bind texture
-		m_d3d_context->PSSetSamplers(0, 1, &m_sampler_state);
-		Gfx::BindTexture(m_d3d_context, temporary_rt);
-		UseProgram(ProgramId::Passthrough);
-
-		// Draw a quad into temporary with source bound as the texture, and the UVs lerping to match the new dimensions
-		// We want to map UV   0 -  1 to src min-max
-		// We want to map pos -1 - +1 to dst min max
-
-		float uv_x_min = float(srcX0) / float(source.width);  // Map to 0
-		float uv_y_max = float(srcY0) / float(source.height); // Map to 0
-		float uv_x_max = float(srcX1) / float(source.width);  // Map to +1
-		float uv_y_min = float(srcY1) / float(source.height); // Map to +1
-
-		float pos_x_min = (dstX0 / float(dest.width)) * 2.0f - 1.0f;
-		float pos_y_min = ((dest.height - dstY0 - dest_height) / float(dest.height)) * 2.0f - 1.0f;
-		float pos_x_max = ((dstX0 + dest_width) / float(dest.width)) * 2.0f - 1.0f;
-		float pos_y_max = ((dest.height - dstY0) / float(dest.height)) * 2.0f - 1.0f;
-
-		Rml::Mesh mesh;
-		const int v0 = (int)mesh.vertices.size();
-		const int i0 = (int)mesh.indices.size();
-
-		mesh.vertices.resize(mesh.vertices.size() + 4);
-		mesh.indices.resize(mesh.indices.size() + 6);
-		Rml::Vertex* vertices = mesh.vertices.data();
-		int* indices = mesh.indices.data();
-
-		vertices[v0 + 0].position.x = pos_x_min;
-		vertices[v0 + 0].position.y = pos_y_min;
-		vertices[v0 + 0].tex_coord.x = uv_x_min;
-		vertices[v0 + 0].tex_coord.y = uv_y_min;
-
-		vertices[v0 + 1].position.x = pos_x_max;
-		vertices[v0 + 1].position.y = pos_y_min;
-		vertices[v0 + 1].tex_coord.x = uv_x_max;
-		vertices[v0 + 1].tex_coord.y = uv_y_min;
-
-		vertices[v0 + 2].position.x = pos_x_max;
-		vertices[v0 + 2].position.y = pos_y_max;
-		vertices[v0 + 2].tex_coord.x = uv_x_max;
-		vertices[v0 + 2].tex_coord.y = uv_y_max;
-
-		vertices[v0 + 3].position.x = pos_x_min;
-		vertices[v0 + 3].position.y = pos_y_max;
-		vertices[v0 + 3].tex_coord.x = uv_x_min;
-		vertices[v0 + 3].tex_coord.y = uv_y_max;
-
-		indices[i0 + 0] = v0 + 0;
-		indices[i0 + 1] = v0 + 3;
-		indices[i0 + 2] = v0 + 1;
-
-		indices[i0 + 3] = v0 + 1;
-		indices[i0 + 4] = v0 + 3;
-		indices[i0 + 5] = v0 + 2;
-
-		const Rml::CompiledGeometryHandle geometry = CompileGeometry(mesh.vertices, mesh.indices);
-		RenderGeometry(geometry, {}, RenderInterface_DX11::TexturePostprocess);
-		ReleaseGeometry(geometry);
-
-		// Restore state
-		m_d3d_context->OMSetRenderTargets(1, &original_render_target_view, original_depth_stencil_view);
-		SetBlendState(m_current_blend_state);
-
-		d3dviewport.Width = static_cast<FLOAT>(m_viewport_width);
-		d3dviewport.Height = static_cast<FLOAT>(m_viewport_height);
-		m_d3d_context->RSSetViewports(1, &d3dviewport);
-		m_d3d_context->PSSetShaderResources(0, 2, null_shader_resource_views);
-		Dx11CleanupResourceIfCreated(original_render_target_view);
-		Dx11CleanupResourceIfCreated(original_depth_stencil_view);
-	}
-	else
+	ID3D11ShaderResourceView* null_views[2] = {nullptr, nullptr};
+	if (full_copy)
 	{
-		// Resolve and move on
-		if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
-		m_d3d_context->ResolveSubresource(dest.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+		if (source.render_target_texture != dest.render_target_texture)
+		{
+			m_d3d_context->PSSetShaderResources(0, 2, null_views);
+			copy_or_resolve(dest);
+		}
+		return;
 	}
+
+	ID3D11RenderTargetView* original_target = nullptr;
+	ID3D11DepthStencilView* original_depth = nullptr;
+	m_d3d_context->OMGetRenderTargets(1, &original_target, &original_depth);
+	ID3D11BlendState* original_blend = m_current_blend_state;
+	const bool original_blend_enabled = m_current_blend_state_enabled;
+	m_d3d_context->PSSetShaderResources(0, 2, null_views);
+	DisableBlend();
+
+	const Gfx::RenderTargetData* sampled = &source;
+	if (!m_optimizations_enabled || source.sample_count > 1 || source.render_target_texture == dest.render_target_texture)
+	{
+		const auto* scratch = &m_render_layers.GetTemporary();
+		auto aliases = [&](const Gfx::RenderTargetData* candidate)
+		{
+			return candidate->render_target_texture == source.render_target_texture || candidate->render_target_texture == dest.render_target_texture;
+		};
+		if (aliases(scratch)) scratch = &m_render_layers.GetPostprocessTertiary();
+		if (aliases(scratch)) scratch = &m_render_layers.GetPostprocessSecondary();
+		RMLUI_ASSERT(!aliases(scratch));
+		m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
+		copy_or_resolve(*scratch);
+		sampled = scratch;
+	}
+
+	// Rebinding the output releases source from its RTV slot before it becomes an SRV.
+	Gfx::BindRenderTarget(m_d3d_context, dest);
+	D3D11_VIEWPORT viewport{};
+	viewport.Width = float(dest.width);
+	viewport.Height = float(dest.height);
+	viewport.MaxDepth = 1.f;
+	m_d3d_context->RSSetViewports(1, &viewport);
+	m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
+	Gfx::BindTexture(m_d3d_context, *sampled);
+	UseProgram(ProgramId::Passthrough);
+
+	const float u0 = float(srcX0) / float(source.width);
+	const float v0 = float(srcY1) / float(source.height);
+	const float u1 = float(srcX1) / float(source.width);
+	const float v1 = float(srcY0) / float(source.height);
+	const float x0 = (dstX0 / float(dest.width)) * 2.f - 1.f;
+	const float y0 = ((dest.height - dstY0 - dest_height) / float(dest.height)) * 2.f - 1.f;
+	const float x1 = ((dstX0 + dest_width) / float(dest.width)) * 2.f - 1.f;
+	const float y1 = ((dest.height - dstY0) / float(dest.height)) * 2.f - 1.f;
+	const Rml::Vertex vertices[4] = {
+		{{x0, y0}, {}, {u0, v0}}, {{x1, y0}, {}, {u1, v0}},
+		{{x1, y1}, {}, {u1, v1}}, {{x0, y1}, {}, {u0, v1}}
+	};
+	DrawQuad({vertices, 4});
+
+	// Restore even when the quad upload failed. The caller may have had blending disabled.
+	m_d3d_context->PSSetShaderResources(0, 2, null_views);
+	m_d3d_context->OMSetRenderTargets(1, &original_target, original_depth);
+	m_current_blend_state = original_blend;
+	if (original_blend_enabled) SetBlendState(original_blend);
+	else DisableBlend();
+	viewport.Width = float(m_viewport_width);
+	viewport.Height = float(m_viewport_height);
+	m_d3d_context->RSSetViewports(1, &viewport);
+	Dx11CleanupResourceIfCreated(original_target);
+	Dx11CleanupResourceIfCreated(original_depth);
 }
 
 void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle)
@@ -1949,14 +1972,15 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 
 	// Copy the destination texture to the final texture resource
 	D3D11_BOX copy_box{};
-	copy_box.left = bounds.Left();
-	copy_box.right = bounds.Right();
-	copy_box.top = bounds.Top();
-	copy_box.bottom = bounds.Bottom();
+	copy_box.left = 0;
+	copy_box.right = bounds.Width();
+	copy_box.top = 0;
+	copy_box.bottom = bounds.Height();
 	copy_box.front = 0;
 	copy_box.back = 1;
 
 	// Copy the blitted content from the destination to the final texture
+	if (m_diagnostic_counters) ++m_diagnostic_counters->copies;
 	m_d3d_context->CopySubresourceRegion(texture_resource, 0, 0, 0, 0, destination.render_target_texture, 0, &copy_box);
 
 	// Restore state and free memory
@@ -2258,6 +2282,8 @@ void RenderInterface_DX11::RenderShader(Rml::CompiledShaderHandle shader_handle,
 
 		// Upload to the GPU.
 		m_d3d_context->Unmap(m_shader_buffer, 0);
+		// The custom upload used its own translation; the next ordinary draw must restore the cached common state.
+		m_cbuffer_dirty = true;
 
 		// Issue draw call
 		m_d3d_context->IASetInputLayout(m_vertex_layout);
@@ -2297,6 +2323,8 @@ void RenderInterface_DX11::RenderShader(Rml::CompiledShaderHandle shader_handle,
 
 		// Upload to the GPU.
 		m_d3d_context->Unmap(m_shader_buffer, 0);
+		// The custom upload used its own translation; the next ordinary draw must restore the cached common state.
+		m_cbuffer_dirty = true;
 
 		// Issue draw call
 		m_d3d_context->IASetInputLayout(m_vertex_layout);
@@ -2392,6 +2420,14 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	}
 
 	const Rml::Rectanglei original_scissor = m_scissor_state;
+	auto restore_state = [&]()
+	{
+		SetScissor(original_scissor);
+		ID3D11ShaderResourceView* null_view = nullptr;
+		m_d3d_context->PSSetShaderResources(0, 1, &null_view);
+		// The blur WRITE_DISCARD upload does not preserve the common transform/translation prefix.
+		m_cbuffer_dirty = true;
+	};
 
 	// Begin by downscaling so that the blur pass can be done at a reduced resolution for large sigma.
 	Rml::Rectanglei scissor = window_flipped;
@@ -2402,7 +2438,8 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	// Downscale by iterative half-scaling with bilinear filtering, to reduce aliasing.
 	D3D11_VIEWPORT d3dviewport{};
 	d3dviewport.TopLeftX = 0;
-	d3dviewport.TopLeftY = static_cast<FLOAT>(source_destination.height / 2);
+	// Align the reduced viewport to the bottom edge, including the extra row of an odd-height target.
+	d3dviewport.TopLeftY = static_cast<FLOAT>(source_destination.height - source_destination.height / 2);
 	d3dviewport.Width = static_cast<FLOAT>(source_destination.width / 2);
 	d3dviewport.Height = static_cast<FLOAT>(source_destination.height / 2);
 	d3dviewport.MinDepth = 0.0f;
@@ -2450,6 +2487,7 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	HRESULT result = m_d3d_context->Map(m_shader_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
 	if (FAILED(result))
 	{
+		restore_state();
 		return;
 	}
 
@@ -2507,8 +2545,7 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	result = m_d3d_context->Map(m_blur_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
 	if (FAILED(result))
 	{
-		ID3D11ShaderResourceView* const nullSRV = nullptr;
-		m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
+		restore_state();
 		return;
 	}
 
@@ -2552,15 +2589,12 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	}
 
 	// Restore render state.
-	SetScissor(original_scissor);
-
-	ID3D11ShaderResourceView* const nullSRV = nullptr;
-	m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
+	restore_state();
 }
 
 void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHandle> filter_handles)
 {
-	m_d3d_context->PSSetSamplers(0, 1, &m_sampler_state);
+	m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
 	// To unbind slots when necessary
 	ID3D11ShaderResourceView* null_shader_resource_views[2] = {nullptr, nullptr};
@@ -2583,7 +2617,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessSecondary();
 			Gfx::BindRenderTarget(m_d3d_context, destination);
 			Gfx::BindTexture(m_d3d_context, source);
-			m_d3d_context->PSSetSamplers(0, 1, &m_sampler_state);
+			m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
 			DrawFullscreenQuad();
 
@@ -2864,7 +2898,7 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 	m_d3d_context->OMSetDepthStencilState(m_depth_stencil_state_stencil_test, m_stencil_ref_value);
 }
 
-RenderInterface_DX11::RenderLayerStack::RenderLayerStack() : m_samples(NUM_MSAA_SAMPLES)
+RenderInterface_DX11::RenderLayerStack::RenderLayerStack()
 {
 	m_rt_postprocess.resize(5);
 }
@@ -2890,7 +2924,7 @@ Rml::LayerHandle RenderInterface_DX11::RenderLayerStack::PushLayer()
 		ID3D11DepthStencilView* shared_depth_stencil = (m_rt_layers.empty() ? nullptr : m_rt_layers.front().depth_stencil_view);
 
 		m_rt_layers.push_back(Gfx::RenderTargetData{});
-		Gfx::CreateRenderTarget(m_d3d_device, m_rt_layers.back(), m_width, m_height, m_samples, Gfx::RenderTargetAttachment::DepthStencil,
+		Gfx::CreateRenderTarget(m_d3d_device, m_rt_layers.back(), m_width, m_height, MsaaSamples, Gfx::RenderTargetAttachment::DepthStencil,
 			shared_depth_stencil);
 	}
 
@@ -2939,16 +2973,6 @@ void RenderInterface_DX11::RenderLayerStack::BeginFrame(int new_width, int new_h
 	}
 
 	PushLayer();
-}
-
-void RenderInterface_DX11::RenderLayerStack::SetMsaaSamples(int samples)
-{
-	RMLUI_ASSERT(m_layers_size == 0);
-	if (m_samples != samples)
-	{
-		DestroyRenderTargets();
-		m_samples = samples;
-	}
 }
 
 void RenderInterface_DX11::RenderLayerStack::EndFrame()
