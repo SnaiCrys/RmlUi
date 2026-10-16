@@ -279,6 +279,17 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
 };
 )";
 
+constexpr const char shader_frag_surface_backdrop[] = RMLUI_SHADER_HEADER R"(
+struct PS_Input { float4 position : SV_Position; float4 color : COLOR; float2 uv : TEXCOORD; };
+Texture2D foreground : register(t0);
+Texture2D background : register(t1);
+SamplerState linearClamp : register(s0);
+float4 PSMain(PS_Input input) : SV_TARGET {
+    float4 color = foreground.Sample(linearClamp, input.uv);
+    return color + background.Sample(linearClamp, input.uv) * (1.0 - color.a);
+}
+)";
+
 static const char shader_frag_resolve[] = RMLUI_SHADER_HEADER R"(
 Texture2DMS<float4, 4> g_InputTexture : register(t0);
 
@@ -506,6 +517,7 @@ enum class ProgramId {
 	DropShadow,
 	Resolve,
 	BlurPaired,
+	SurfaceBackdrop,
 	Count,
 };
 enum class VertShaderId {
@@ -515,6 +527,7 @@ enum class VertShaderId {
 	Count,
 };
 enum class FragShaderId {
+	SurfaceBackdrop,
 	Color,
 	Texture,
 	Gradient,
@@ -559,6 +572,7 @@ static const VertShaderDefinition vert_shader_definitions[] = {
     {VertShaderId::Blur,        "blur",         shader_vert_blur,           sizeof(shader_vert_blur)},
 };
 static const FragShaderDefinition frag_shader_definitions[] = {
+    {FragShaderId::SurfaceBackdrop, "surface_backdrop", shader_frag_surface_backdrop, sizeof(shader_frag_surface_backdrop)},
     {FragShaderId::Color,       "color",        shader_frag_color,          sizeof(shader_frag_color)},
     {FragShaderId::Texture,     "texture",      shader_frag_texture,        sizeof(shader_frag_texture)},
     {FragShaderId::Gradient,    "gradient",     shader_frag_gradient,       sizeof(shader_frag_gradient)},
@@ -570,6 +584,7 @@ static const FragShaderDefinition frag_shader_definitions[] = {
     {FragShaderId::DropShadow,  "drop_shadow",  shader_frag_drop_shadow,    sizeof(shader_frag_drop_shadow)},
 };
 static const ProgramDefinition program_definitions[] = {
+    {ProgramId::SurfaceBackdrop, "surface_backdrop", VertShaderId::Passthrough, FragShaderId::SurfaceBackdrop},
     {ProgramId::Color,       "color",        VertShaderId::Main,        FragShaderId::Color},
     {ProgramId::Texture,     "texture",      VertShaderId::Main,        FragShaderId::Texture},
     {ProgramId::Gradient,    "gradient",     VertShaderId::Main,        FragShaderId::Gradient},
@@ -917,7 +932,7 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 	m_d3d_device->AddRef();
 	m_d3d_device->QueryInterface(__uuidof(ID3D11Device1), (void**)&m_d3d_device_1);
 	m_d3d_device_1->GetImmediateContext1(&m_d3d_context);
-	m_render_layers.SetD3DResources(m_d3d_device);
+	m_render_layers->SetD3DResources(m_d3d_device);
 
 	// Pre-cache quad for blitting
 	Rml::Mesh mesh;
@@ -1292,10 +1307,10 @@ void RenderInterface_DX11::BeginFrame()
 
 	SetTransform(nullptr);
 
-	m_render_layers.BeginFrame(m_viewport_width, m_viewport_height);
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	m_render_layers->BeginFrame(m_viewport_width, m_viewport_height);
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 	float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	m_d3d_context->ClearRenderTargetView(m_render_layers.GetTopLayer().render_target_view, clearColor);
+	m_d3d_context->ClearRenderTargetView(m_render_layers->GetTopLayer().render_target_view, clearColor);
 
 	UseProgram(ProgramId::None);
 	m_scissor_state = Rml::Rectanglei::MakeInvalid();
@@ -1305,8 +1320,8 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 {
 	RMLUI_ASSERTMSG(p_render_target_view, "p_render_target_view cannot be nullptr!");
 
-	const Gfx::RenderTargetData& rt_active = m_render_layers.GetTopLayer();
-	const Gfx::RenderTargetData& rt_postprocess = m_render_layers.GetPostprocessPrimary();
+	const Gfx::RenderTargetData& rt_active = m_render_layers->GetTopLayer();
+	const Gfx::RenderTargetData& rt_postprocess = m_render_layers->GetPostprocessPrimary();
 
 	// Resolve MSAA to the post-process framebuffer.
 	m_d3d_context->ResolveSubresource(rt_postprocess.render_target_texture, 0, rt_active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1323,7 +1338,12 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 
 	DrawFullscreenQuad();
 
-	m_render_layers.EndFrame();
+	FinishFrame();
+}
+
+void RenderInterface_DX11::FinishFrame()
+{
+	m_render_layers->EndFrame();
 
 	// Reset internal state
 	m_current_blend_state = nullptr;
@@ -1918,13 +1938,13 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	const Gfx::RenderTargetData* sampled = &source;
 	if (source.sample_count > 1 || source.render_target_texture == dest.render_target_texture)
 	{
-		const auto* scratch = &m_render_layers.GetTemporary();
+		const auto* scratch = &m_render_layers->GetTemporary();
 		auto aliases = [&](const Gfx::RenderTargetData* candidate)
 		{
 			return candidate->render_target_texture == source.render_target_texture || candidate->render_target_texture == dest.render_target_texture;
 		};
-		if (aliases(scratch)) scratch = &m_render_layers.GetPostprocessTertiary();
-		if (aliases(scratch)) scratch = &m_render_layers.GetPostprocessSecondary();
+		if (aliases(scratch)) scratch = &m_render_layers->GetPostprocessTertiary();
+		if (aliases(scratch)) scratch = &m_render_layers->GetPostprocessSecondary();
 		RMLUI_ASSERT(!aliases(scratch));
 		m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
 		copy_or_resolve(*scratch);
@@ -1971,8 +1991,8 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 
 void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional)
 {
-	const Gfx::RenderTargetData& source = m_render_layers.GetLayer(layer_handle);
-	const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessPrimary();
+	const Gfx::RenderTargetData& source = m_render_layers->GetLayer(layer_handle);
+	const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessPrimary();
 
 	// Resolving a small input region avoids reading the whole MSAA layer. Retain full-size targets and pixel coordinates.
 	if (allow_regional && m_scissor_state.Valid()
@@ -2020,11 +2040,11 @@ void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_
 
 Rml::LayerHandle RenderInterface_DX11::PushLayer()
 {
-	const Rml::LayerHandle layer_handle = m_render_layers.PushLayer();
+	const Rml::LayerHandle layer_handle = m_render_layers->PushLayer();
 
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 	float colors[4] = {0, 0, 0, 0};
-	m_d3d_context->ClearRenderTargetView(m_render_layers.GetTopLayer().render_target_view, colors);
+	m_d3d_context->ClearRenderTargetView(m_render_layers->GetTopLayer().render_target_view, colors);
 
 	return layer_handle;
 }
@@ -2058,14 +2078,32 @@ void RenderInterface_DX11::CompositeLayersInternal(Rml::LayerHandle source_handl
 	// applied, because we need to resolve the multi-sampled framebuffer in any case.
 	// @performance If we have BlendMode::Replace and no filters or mask then we can just blit directly to the destination.
 	BlitLayerToPostprocessPrimary(source_handle, true);
+	if (m_backdrop_active && source_handle == 0 && m_backdrop_texture)
+	{
+		const auto& source = m_render_layers->GetPostprocessPrimary();
+		const auto& destination = m_render_layers->GetPostprocessSecondary();
+		Gfx::BindRenderTarget(m_d3d_context, destination);
+		Gfx::BindTexture(m_d3d_context, source);
+		m_d3d_context->PSSetShaderResources(1, 1, &m_backdrop_texture);
+		m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
+		const auto blend = m_current_blend_state;
+		const bool blending = m_current_blend_state_enabled;
+		DisableBlend();
+		UseProgram(ProgramId::SurfaceBackdrop);
+		DrawFullscreenQuad();
+		ID3D11ShaderResourceView* nullView = nullptr;
+		m_d3d_context->PSSetShaderResources(1, 1, &nullView);
+		if (blending) SetBlendState(blend);
+		m_render_layers->SwapPostprocessPrimarySecondary();
+	}
 
 	// Render the filters, the PostprocessPrimary framebuffer is used for both input and output.
 	RenderFilters(filters);
 	SetScissor(output_bounds);
 
 	// Render to the destination layer.
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetLayer(destination_handle));
-	Gfx::BindTexture(m_d3d_context, m_render_layers.GetPostprocessPrimary());
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetLayer(destination_handle));
+	Gfx::BindTexture(m_d3d_context, m_render_layers->GetPostprocessPrimary());
 
 	UseProgram(ProgramId::Passthrough);
 
@@ -2077,14 +2115,14 @@ void RenderInterface_DX11::CompositeLayersInternal(Rml::LayerHandle source_handl
 	if (blend_mode == BlendMode::Replace)
 		SetBlendState(m_current_blend_state);
 
-	if (destination_handle != m_render_layers.GetTopLayerHandle())
-		Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	if (destination_handle != m_render_layers->GetTopLayerHandle())
+		Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 }
 
 void RenderInterface_DX11::PopLayer()
 {
-	m_render_layers.PopLayer();
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	m_render_layers->PopLayer();
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 }
 
 Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
@@ -2098,12 +2136,12 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 		return {};
 	}
 
-	BlitLayerToPostprocessPrimary(m_render_layers.GetTopLayerHandle());
+	BlitLayerToPostprocessPrimary(m_render_layers->GetTopLayerHandle());
 
 	EnableScissorRegion(false);
 
-	const Gfx::RenderTargetData& source = m_render_layers.GetPostprocessPrimary();
-	const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessSecondary();
+	const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
+	const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
 
 	// Flip the image vertically, as that convention is used for textures, and move to origin.
 	BlitRenderTarget(source, destination, bounds.Left(), source.height - bounds.Bottom(), // src0
@@ -2133,7 +2171,7 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 
 	// Restore state and free memory
 	SetScissor(bounds);
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 	texture_resource->Release();
 
 	return render_texture;
@@ -2159,10 +2197,10 @@ struct CompiledFilter {
 
 Rml::CompiledFilterHandle RenderInterface_DX11::SaveLayerAsMaskImage()
 {
-	BlitLayerToPostprocessPrimary(m_render_layers.GetTopLayerHandle());
+	BlitLayerToPostprocessPrimary(m_render_layers->GetTopLayerHandle());
 
-	const Gfx::RenderTargetData& source = m_render_layers.GetPostprocessPrimary();
-	const Gfx::RenderTargetData& destination = m_render_layers.GetBlendMask();
+	const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
+	const Gfx::RenderTargetData& destination = m_render_layers->GetBlendMask();
 
 	// Unbind resources
 	ID3D11ShaderResourceView* const nullSRV = nullptr;
@@ -2180,7 +2218,7 @@ Rml::CompiledFilterHandle RenderInterface_DX11::SaveLayerAsMaskImage()
 	m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
 
 	SetBlendState(blend_state_backup);
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 
 	CompiledFilter filter = {};
 	filter.type = FilterType::MaskImage;
@@ -2769,15 +2807,15 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			m_d3d_context->OMSetBlendState(m_blend_state_color_filter, blend_factor, 0xFFFFFFFF);
 			m_current_blend_state = m_blend_state_color_filter;
 
-			const Gfx::RenderTargetData& source = m_render_layers.GetPostprocessPrimary();
-			const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessSecondary();
+			const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
+			const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
 			Gfx::BindRenderTarget(m_d3d_context, destination);
 			Gfx::BindTexture(m_d3d_context, source);
 			m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
 			DrawFullscreenQuad();
 
-			m_render_layers.SwapPostprocessPrimarySecondary();
+			m_render_layers->SwapPostprocessPrimarySecondary();
 			SetBlendState(m_blend_state_enable);
 			m_d3d_context->PSSetShaderResources(0, 2, null_shader_resource_views);
 		}
@@ -2787,8 +2825,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			ID3D11BlendState* blend_state_backup = m_current_blend_state;
 			DisableBlend();
 
-			const Gfx::RenderTargetData& source_destination = m_render_layers.GetPostprocessPrimary();
-			const Gfx::RenderTargetData& temp = m_render_layers.GetPostprocessSecondary();
+			const Gfx::RenderTargetData& source_destination = m_render_layers->GetPostprocessPrimary();
+			const Gfx::RenderTargetData& temp = m_render_layers->GetPostprocessSecondary();
 
 			const Rml::Rectanglei window_flipped = VerticallyFlipped(m_scissor_state, m_viewport_height);
 			RenderBlur(filter.sigma, source_destination, temp, window_flipped);
@@ -2802,8 +2840,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			ID3D11BlendState* blend_state_backup = m_current_blend_state;
 			DisableBlend();
 
-			const Gfx::RenderTargetData& primary = m_render_layers.GetPostprocessPrimary();
-			const Gfx::RenderTargetData& secondary = m_render_layers.GetPostprocessSecondary();
+			const Gfx::RenderTargetData& primary = m_render_layers->GetPostprocessPrimary();
+			const Gfx::RenderTargetData& secondary = m_render_layers->GetPostprocessSecondary();
 			Gfx::BindRenderTarget(m_d3d_context, secondary);
 			Gfx::BindTexture(m_d3d_context, primary);
 
@@ -2840,7 +2878,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			if (filter.sigma >= 0.5f)
 			{
-				const Gfx::RenderTargetData& tertiary = m_render_layers.GetPostprocessTertiary();
+				const Gfx::RenderTargetData& tertiary = m_render_layers->GetPostprocessTertiary();
 				RenderBlur(filter.sigma, secondary, tertiary, window_flipped);
 			}
 
@@ -2850,7 +2888,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			SetBlendState(blend_state_backup);
 			DrawFullscreenQuad();
 
-			m_render_layers.SwapPostprocessPrimarySecondary();
+			m_render_layers->SwapPostprocessPrimarySecondary();
 
 			ID3D11ShaderResourceView* const nullSRV = nullptr;
 			m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
@@ -2864,8 +2902,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			ID3D11BlendState* blend_state_backup = m_current_blend_state;
 			DisableBlend();
 
-			const Gfx::RenderTargetData& source = m_render_layers.GetPostprocessPrimary();
-			const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessSecondary();
+			const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
+			const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
 			Gfx::BindRenderTarget(m_d3d_context, destination);
 			Gfx::BindTexture(m_d3d_context, source);
 
@@ -2903,7 +2941,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			ID3D11Buffer* null_cbuffer = nullptr;
 			m_d3d_context->PSSetConstantBuffers(1, 1, &null_cbuffer);
 
-			m_render_layers.SwapPostprocessPrimarySecondary();
+			m_render_layers->SwapPostprocessPrimarySecondary();
 
 			// Restore blend state
 			SetBlendState(blend_state_backup);
@@ -2919,9 +2957,9 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			ID3D11BlendState* blend_state_backup = m_current_blend_state;
 			DisableBlend();
 
-			const Gfx::RenderTargetData& source = m_render_layers.GetPostprocessPrimary();
-			const Gfx::RenderTargetData& blend_mask = m_render_layers.GetBlendMask();
-			const Gfx::RenderTargetData& destination = m_render_layers.GetPostprocessSecondary();
+			const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
+			const Gfx::RenderTargetData& blend_mask = m_render_layers->GetBlendMask();
+			const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
 
 			Gfx::BindRenderTarget(m_d3d_context, destination);
 			Gfx::BindTexture(m_d3d_context, source, 0);
@@ -2929,7 +2967,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			DrawFullscreenQuad();
 
-			m_render_layers.SwapPostprocessPrimarySecondary();
+			m_render_layers->SwapPostprocessPrimarySecondary();
 			SetBlendState(blend_state_backup);
 			m_d3d_context->PSSetShaderResources(0, 2, null_shader_resource_views);
 		}
@@ -3033,15 +3071,15 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 	float blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 	m_d3d_context->OMSetBlendState(m_blend_state_disable_color, blendFactor, 0xffffffff);
 
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
+	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 	m_d3d_context->OMSetDepthStencilState(stencil_state, 1);
 
 	bool clear_stencil = (operation == ClipMaskOperation::Set || operation == ClipMaskOperation::SetInverse);
 	if (clear_stencil)
 	{
 		// Clear stencil buffer
-		Rml::LayerHandle layer_handle = m_render_layers.GetTopLayerHandle();
-		const Gfx::RenderTargetData& rtData = m_render_layers.GetLayer(layer_handle);
+		Rml::LayerHandle layer_handle = m_render_layers->GetTopLayerHandle();
+		const Gfx::RenderTargetData& rtData = m_render_layers->GetLayer(layer_handle);
 		m_d3d_context->ClearDepthStencilView(rtData.depth_stencil_view, D3D11_CLEAR_STENCIL, 1.0f, 0);
 	}
 
@@ -3052,6 +3090,45 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 	// Restore state
 	m_stencil_ref_value = stencil_test_value;
 	m_d3d_context->OMSetDepthStencilState(m_depth_stencil_state_stencil_test, m_stencil_ref_value);
+}
+
+struct RenderInterface_DX11::SurfaceTarget
+{
+	RenderLayerStack layers;
+};
+
+RenderInterface_DX11::SurfaceTarget* RenderInterface_DX11::CreateSurfaceTarget()
+{
+	auto target = new SurfaceTarget;
+	target->layers.SetD3DResources(m_d3d_device);
+	return target;
+}
+
+void RenderInterface_DX11::ReleaseSurfaceTarget(SurfaceTarget* target) { delete target; }
+
+void RenderInterface_DX11::SetSurfaceTarget(SurfaceTarget* target)
+{
+	m_render_layers = target ? &target->layers : &m_default_render_layers;
+}
+
+ID3D11RenderTargetView* RenderInterface_DX11::GetCurrentRenderTarget() const
+{
+	return m_render_layers->GetTopLayer().render_target_view;
+}
+
+ID3D11ShaderResourceView* RenderInterface_DX11::GetCurrentLayerView() const
+{
+	return m_render_layers->GetTopLayer().render_target_shader_resource_view;
+}
+
+ID3D11ShaderResourceView* RenderInterface_DX11::EndFrameTexture()
+{
+	const auto& active = m_render_layers->GetTopLayer();
+	const auto& resolved = m_render_layers->GetPostprocessPrimary();
+	m_d3d_context->ResolveSubresource(resolved.render_target_texture, 0, active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+	auto view = resolved.render_target_shader_resource_view;
+	FinishFrame();
+	return view;
 }
 
 RenderInterface_DX11::RenderLayerStack::RenderLayerStack()

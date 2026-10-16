@@ -179,7 +179,7 @@ void ElementText::OnRender()
 	// culling in complicated transform cases, for simplicity we always proceed to render if one is detected.
 	Rectanglei scissor_region = render_manager.GetScissorRegion();
 	if (!scissor_region.Valid())
-		scissor_region = Rectanglei::FromSize(render_manager.GetViewport());
+		scissor_region = render_manager.GetRenderBounds();
 
 	if (!GetTransformState() || !GetTransformState()->GetTransform())
 	{

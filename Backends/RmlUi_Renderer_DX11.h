@@ -44,6 +44,18 @@ public:
 	void RestorePartialRenderState();
 	static constexpr int MsaaSamples = 4;
 
+	struct SurfaceTarget;
+	SurfaceTarget* CreateSurfaceTarget();
+	void ReleaseSurfaceTarget(SurfaceTarget* target);
+	// Select outside BeginFrame/EndFrame. Targets retain their private stencil and scratch layers.
+	void SetSurfaceTarget(SurfaceTarget* target);
+	ID3D11ShaderResourceView* EndFrameTexture();
+	ID3D11RenderTargetView* GetCurrentRenderTarget() const;
+	ID3D11ShaderResourceView* GetCurrentLayerView() const;
+	void SetBackdropTexture(ID3D11ShaderResourceView* view) { m_backdrop_texture = view; }
+	void BeginBackdropFilter() override { m_backdrop_active = true; }
+	void EndBackdropFilter() override { m_backdrop_active = false; }
+
 	// -- Inherited from Rml::RenderInterface --
 
 	Rml::CompiledGeometryHandle CompileGeometry(Rml::Span<const Rml::Vertex> vertices, Rml::Span<const int> indices) override;
@@ -90,6 +102,7 @@ public:
 	static constexpr Rml::TextureHandle TexturePostprocessNoBinding = Rml::TextureHandle(-3);
 
 private:
+	void FinishFrame();
 	// Changes blend state if necessary
 	void SetBlendState(ID3D11BlendState* blend_state);
 	void DisableBlend();
@@ -289,5 +302,8 @@ private:
 		ID3D11Device* m_d3d_device = nullptr;
 	};
 
-	RenderLayerStack m_render_layers;
+	RenderLayerStack m_default_render_layers;
+	RenderLayerStack* m_render_layers = &m_default_render_layers;
+	ID3D11ShaderResourceView* m_backdrop_texture = nullptr;
+	bool m_backdrop_active = false;
 };

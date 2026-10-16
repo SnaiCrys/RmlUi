@@ -255,6 +255,7 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 
 		if (!backdrop_filters.empty())
 		{
+			render_manager->BeginBackdropFilter();
 			const LayerHandle backdrop_destination_layer = render_manager->GetTopLayer();
 
 			FilterHandleList filter_handles;
@@ -283,6 +284,7 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 				render_manager->PopLayer();
 			}
 			render_manager->SetScissorRegion(initial_scissor_region);
+			render_manager->EndBackdropFilter();
 		}
 	}
 	else if (render_stage == RenderStage::Exit)
@@ -317,6 +319,20 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 			render_manager->PopLayer();
 			render_manager->SetScissorRegion(initial_scissor_region);
 		}
+	}
+}
+
+void ElementEffects::ExtendSurfaceInkOverflow(Rectanglef& bounds)
+{
+	InstanceEffects();
+	ReloadEffectsData();
+	for (const auto& filter : filters) filter.filter->ExtendInkOverflow(element, bounds);
+	if (!backdrop_filters.empty())
+	{
+		Rectanglef backdrop_bounds = Rectanglef::MakeInvalid();
+		ElementUtilities::GetBoundingBox(backdrop_bounds, element, BoxArea::Border);
+		for (const auto& filter : backdrop_filters) filter.filter->ExtendInkOverflow(element, backdrop_bounds);
+		bounds = bounds.Join(backdrop_bounds);
 	}
 }
 

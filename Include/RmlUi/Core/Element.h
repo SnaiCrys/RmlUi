@@ -53,6 +53,10 @@ public:
 	Element(const String& tag);
 	virtual ~Element();
 
+	/// Isolate this subtree for an application render surface. Zero restores ordinary rendering.
+	void SetRenderSurface(uintptr_t id);
+	uintptr_t GetRenderSurface() const { return render_surface; }
+
 	/// Clones this element, returning a new, unparented element.
 	ElementPtr Clone() const;
 
@@ -593,6 +597,7 @@ public:
 protected:
 	void Update(float dp_ratio, Vector2f vp_dimensions);
 	void Render();
+	Rectanglef GetRenderSurfaceBounds();
 
 	/// Updates definition, computed values, and runs OnPropertyChange on this element.
 	void UpdateProperties(float dp_ratio, Vector2f vp_dimensions);
@@ -709,6 +714,7 @@ private:
 	bool local_stacking_context;
 	bool local_stacking_context_forced;
 	bool stacking_context_dirty;
+	uintptr_t render_surface = 0;
 	bool computed_values_are_default_initialized;
 
 	bool visible; // True if the element is visible and active.

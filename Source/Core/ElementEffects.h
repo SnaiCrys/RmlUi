@@ -23,6 +23,7 @@ public:
 	void InstanceEffects();
 
 	void RenderEffects(RenderStage render_stage);
+	void ExtendSurfaceInkOverflow(Rectanglef& bounds);
 
 	// Mark effects as dirty and force them to reset themselves.
 	void DirtyEffects();

@@ -7,6 +7,8 @@
 
 namespace Rml {
 
+enum class SurfaceRenderMode { Default, Capture, Skip };
+
 enum class ClipMaskOperation {
 	Set,        // Set the clip mask to the area of the rendered geometry, clearing any existing clip mask.
 	SetInverse, // Set the clip mask to the area *outside* the rendered geometry, clearing any existing clip mask.
@@ -91,6 +93,16 @@ public:
 	/// multiplication with the transform.
 	/// @note The transform applies to all functions that render with a geometry handle, and only those.
 	virtual void SetTransform(const Matrix4f* transform);
+
+	/// Optional isolated subtree capture. Default retains normal rendering; Skip omits the subtree.
+	virtual SurfaceRenderMode BeginRenderSurface(uintptr_t id, Rectanglef border_box, Rectanglei paint_bounds);
+	virtual void EndRenderSurface();
+	/// Identifies backdrop reads separately from ordinary filter compositing.
+	virtual void BeginBackdropFilter();
+	virtual void EndBackdropFilter();
+	// Callback textures use their own pixel coordinates, independently of an enclosing render surface.
+	virtual void BeginTextureGeneration();
+	virtual void EndTextureGeneration();
 
 	/// Called by RmlUi when it wants to push a new layer onto the render stack, setting it as the new render target.
 	/// @return An application-specified handle representing the new layer. The value 'zero' is reserved for the initial base layer.

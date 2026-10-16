@@ -50,6 +50,7 @@ public:
 	void PrepareRender(Vector2i dimensions);
 	void SetViewport(Vector2i dimensions);
 	Vector2i GetViewport() const;
+	Rectanglei GetRenderBounds() const;
 
 	void DisableScissorRegion();
 	void SetScissorRegion(Rectanglei region);
@@ -66,6 +67,12 @@ public:
 	const RenderState& GetState() const { return state; }
 	void SetState(const RenderState& next);
 	void ResetState();
+	SurfaceRenderMode BeginRenderSurface(uintptr_t id, Rectanglef border_box, Rectanglei paint_bounds);
+	void EndRenderSurface(const RenderState& previous);
+	void BeginBackdropFilter();
+	void EndBackdropFilter();
+	void BeginTextureGeneration();
+	void EndTextureGeneration();
 
 	Geometry MakeGeometry(Mesh&& mesh);
 
@@ -122,6 +129,12 @@ private:
 
 	RenderState state;
 	Vector2i viewport_dimensions;
+	Rectanglei surface_clip_bounds = Rectanglei::MakeInvalid();
+	struct TextureGenerationState {
+		Rectanglei clip_bounds;
+		RenderState render_state;
+	};
+	Vector<TextureGenerationState> texture_generation_states;
 
 	Vector<LayerHandle> render_stack;
 

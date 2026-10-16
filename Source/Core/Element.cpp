@@ -10,6 +10,7 @@
 #include "../../Include/RmlUi/Core/Math.h"
 #include "../../Include/RmlUi/Core/Profiling.h"
 #include "../../Include/RmlUi/Core/PropertiesIteratorView.h"
+#include "../../Include/RmlUi/Core/RenderManager.h"
 #include "../../Include/RmlUi/Core/PropertyDefinition.h"
 #include "../../Include/RmlUi/Core/PropertyIdSet.h"
 #include "../../Include/RmlUi/Core/StyleSheet.h"
@@ -191,6 +192,19 @@ void Element::Render()
 		BuildLocalStackingContext();
 
 	UpdateTransformState();
+	RenderManager* surface_manager = (render_surface ? GetRenderManager() : nullptr);
+	RenderState previous_surface_state;
+	bool captured_surface = false;
+	if (surface_manager)
+	{
+		previous_surface_state = surface_manager->GetState();
+		auto bounds = GetRenderSurfaceBounds();
+		Math::ExpandToPixelGrid(bounds);
+		const auto mode = surface_manager->BeginRenderSurface(render_surface,
+			Rectanglef::FromPositionSize(GetAbsoluteOffset(BoxArea::Border), GetBox().GetSize(BoxArea::Border)), Rectanglei(bounds));
+		if (mode == SurfaceRenderMode::Skip) return;
+		captured_surface = mode == SurfaceRenderMode::Capture;
+	}
 	ElementUtilities::ApplyTransform(*this);
 
 	meta->effects.RenderEffects(RenderStage::Enter);
@@ -211,6 +225,34 @@ void Element::Render()
 
 	ElementUtilities::ApplyTransform(*this);
 	meta->effects.RenderEffects(RenderStage::Exit);
+	if (captured_surface) surface_manager->EndRenderSurface(previous_surface_state);
+}
+
+void Element::SetRenderSurface(uintptr_t id)
+{
+	if (render_surface == id) return;
+	render_surface = id;
+	const auto& values = GetComputedValues();
+	local_stacking_context = id || local_stacking_context_forced || values.z_index().type != Style::ZIndex::Auto ||
+		values.has_filter() || values.has_backdrop_filter() || values.has_mask_image() ||
+		values.has_local_transform() || values.has_local_perspective();
+	stacking_context.clear();
+	stacking_context_dirty = local_stacking_context;
+	DirtyStackingContext();
+}
+
+Rectanglef Element::GetRenderSurfaceBounds()
+{
+	UpdateAbsoluteOffsetAndRenderBoxData();
+	UpdateTransformState();
+	Rectanglef bounds = Rectanglef::MakeInvalid();
+	ElementUtilities::GetBoundingBox(bounds, this, BoxArea::Auto);
+	for (const auto& child : children)
+	{
+		if (child->IsVisible()) bounds = bounds.Join(child->GetRenderSurfaceBounds());
+	}
+	meta->effects.ExtendSurfaceInkOverflow(bounds);
+	return bounds;
 }
 
 ElementPtr Element::Clone() const
@@ -1889,7 +1931,7 @@ void Element::OnPropertyChange(const PropertyIdSet& changed_properties)
 		const Style::ZIndex z_index_property = meta->computed_values.z_index();
 
 		const float new_z_index = (z_index_property.type == Style::ZIndex::Auto ? 0.f : z_index_property.value);
-		const bool enable_local_stacking_context = (z_index_property.type != Style::ZIndex::Auto || local_stacking_context_forced ||
+		const bool enable_local_stacking_context = (render_surface || z_index_property.type != Style::ZIndex::Auto || local_stacking_context_forced ||
 			meta->computed_values.has_filter() || meta->computed_values.has_backdrop_filter() || meta->computed_values.has_mask_image() ||
 			meta->computed_values.has_local_transform() || meta->computed_values.has_local_perspective());
 

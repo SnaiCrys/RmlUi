@@ -64,6 +64,11 @@ Vector2i RenderManager::GetViewport() const
 	return viewport_dimensions;
 }
 
+Rectanglei RenderManager::GetRenderBounds() const
+{
+	return surface_clip_bounds.Valid() ? surface_clip_bounds : Rectanglei::FromSize(viewport_dimensions);
+}
+
 Geometry RenderManager::MakeGeometry(Mesh&& mesh)
 {
 	if (!mesh)
@@ -102,7 +107,7 @@ void RenderManager::SetScissorRegion(Rectanglei new_region)
 
 	if (new_scissor_enable)
 	{
-		new_region = new_region.Intersect(Rectanglei::FromSize(viewport_dimensions));
+		new_region = new_region.Intersect(GetRenderBounds());
 
 		if (new_region != state.scissor_region)
 			render_interface->SetScissorRegion(new_region);
@@ -187,6 +192,57 @@ void RenderManager::SetState(const RenderState& next)
 void RenderManager::ResetState()
 {
 	SetState(RenderState{});
+}
+
+SurfaceRenderMode RenderManager::BeginRenderSurface(uintptr_t id, Rectanglef border_box, Rectanglei paint_bounds)
+{
+	const RenderState previous = state;
+	const auto mode = render_interface->BeginRenderSurface(id, border_box, paint_bounds);
+	if (mode != SurfaceRenderMode::Capture) return mode;
+	RMLUI_ASSERT(render_stack.empty());
+	// The capture has its own render state; resend inherited state even if it did not change in the outer pass.
+	surface_clip_bounds = paint_bounds;
+	state = {};
+	SetState(previous);
+	return SurfaceRenderMode::Capture;
+}
+
+void RenderManager::EndRenderSurface(const RenderState& previous)
+{
+	RMLUI_ASSERT(render_stack.empty());
+	ResetState();
+	render_interface->EndRenderSurface();
+	surface_clip_bounds = Rectanglei::MakeInvalid();
+	state = {};
+	SetState(previous);
+}
+
+void RenderManager::BeginBackdropFilter() { render_interface->BeginBackdropFilter(); }
+void RenderManager::EndBackdropFilter() { render_interface->EndBackdropFilter(); }
+
+void RenderManager::BeginTextureGeneration()
+{
+	render_interface->BeginTextureGeneration();
+	if (surface_clip_bounds.Valid() || !texture_generation_states.empty())
+	{
+		texture_generation_states.push_back({surface_clip_bounds, state});
+		// Callback textures use coordinates relative to their own texture, not the world surface.
+		surface_clip_bounds = Rectanglei::MakeInvalid();
+		ResetState();
+	}
+}
+
+void RenderManager::EndTextureGeneration()
+{
+	if (!texture_generation_states.empty())
+	{
+		const auto previous = std::move(texture_generation_states.back());
+		texture_generation_states.pop_back();
+		surface_clip_bounds = previous.clip_bounds;
+		// Keep restoration in the preparation recording, outside the surface's cache fingerprint.
+		SetState(previous.render_state);
+	}
+	render_interface->EndTextureGeneration();
 }
 
 StableVectorIndex RenderManager::InsertGeometry(Mesh&& mesh)
