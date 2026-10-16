@@ -1176,6 +1176,17 @@ void RenderInterface_DX11::BeginFrame()
 	m_scissor_state = Rml::Rectanglei::MakeInvalid();
 }
 
+bool RenderInterface_DX11::SetMsaaSamples(int samples)
+{
+	if (samples != 2 && samples != 4)
+		return false;
+	UINT levels = 0;
+	if (FAILED(m_d3d_device->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, samples, &levels)) || !levels)
+		return false;
+	m_render_layers.SetMsaaSamples(samples);
+	return true;
+}
+
 void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view)
 {
 	RMLUI_ASSERTMSG(p_render_target_view, "p_render_target_view cannot be nullptr!");
@@ -1184,6 +1195,7 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 	const Gfx::RenderTargetData& rt_postprocess = m_render_layers.GetPostprocessPrimary();
 
 	// Resolve MSAA to the post-process framebuffer.
+	if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
 	m_d3d_context->ResolveSubresource(rt_postprocess.render_target_texture, 0, rt_active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
 
 	// Draw to bound_render_target (usually the swapchain RTV)
@@ -1310,6 +1322,7 @@ Rml::CompiledGeometryHandle RenderInterface_DX11::CompileGeometry(Rml::Span<cons
 		vertexData.SysMemSlicePitch = 0;
 
 		HRESULT result = m_d3d_device->CreateBuffer(&vertexBufferDesc, &vertexData, &vertex_buffer);
+		if (SUCCEEDED(result) && m_diagnostic_counters) ++m_diagnostic_counters->geometry_buffers;
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateBuffer");
 		if (FAILED(result))
 		{
@@ -1333,6 +1346,7 @@ Rml::CompiledGeometryHandle RenderInterface_DX11::CompileGeometry(Rml::Span<cons
 		indexData.SysMemSlicePitch = 0;
 
 		HRESULT result = m_d3d_device->CreateBuffer(&indexBufferDesc, &indexData, &index_buffer);
+		if (SUCCEEDED(result) && m_diagnostic_counters) ++m_diagnostic_counters->geometry_buffers;
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateBuffer");
 		if (FAILED(result))
 		{
@@ -1407,6 +1421,7 @@ void RenderInterface_DX11::RenderGeometry(Rml::CompiledGeometryHandle handle, Rm
 	m_d3d_context->IASetIndexBuffer(geometry->index_buffer, DXGI_FORMAT_R32_UINT, 0);
 	m_d3d_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	m_d3d_context->DrawIndexed(static_cast<UINT>(geometry->index_count), 0, 0);
+	if (m_diagnostic_counters) ++m_diagnostic_counters->draws;
 
 	// Unbind resources
 	ID3D11ShaderResourceView* const nullSRV = nullptr;
@@ -1747,6 +1762,7 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 		DisableBlend();
 
 		// Resolve from source to the temporary first
+		if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
 		m_d3d_context->ResolveSubresource(temporary_rt.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
 
 		// Bind destination as our final render texture
@@ -1835,6 +1851,7 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	else
 	{
 		// Resolve and move on
+		if (m_diagnostic_counters) ++m_diagnostic_counters->resolves;
 		m_d3d_context->ResolveSubresource(dest.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
 	}
 }
@@ -1850,6 +1867,7 @@ void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_
 
 Rml::LayerHandle RenderInterface_DX11::PushLayer()
 {
+	if (m_diagnostic_counters) ++m_diagnostic_counters->layers;
 	const Rml::LayerHandle layer_handle = m_render_layers.PushLayer();
 
 	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetTopLayer());
@@ -1862,6 +1880,7 @@ Rml::LayerHandle RenderInterface_DX11::PushLayer()
 void RenderInterface_DX11::CompositeLayers(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle, Rml::BlendMode blend_mode,
 	Rml::Span<const Rml::CompiledFilterHandle> filters)
 {
+	if (m_diagnostic_counters) ++m_diagnostic_counters->composites;
 	using Rml::BlendMode;
 
 	// Blit source layer to postprocessing buffer. Do this regardless of whether we actually have any filters to be
@@ -2250,6 +2269,7 @@ void RenderInterface_DX11::RenderShader(Rml::CompiledShaderHandle shader_handle,
 		m_d3d_context->IASetIndexBuffer(geometry->index_buffer, DXGI_FORMAT_R32_UINT, 0);
 		m_d3d_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		m_d3d_context->DrawIndexed(static_cast<UINT>(geometry->index_count), 0, 0);
+		if (m_diagnostic_counters) ++m_diagnostic_counters->draws;
 	}
 	break;
 	case CompiledShaderType::Creation:
@@ -2288,6 +2308,7 @@ void RenderInterface_DX11::RenderShader(Rml::CompiledShaderHandle shader_handle,
 		m_d3d_context->IASetIndexBuffer(geometry->index_buffer, DXGI_FORMAT_R32_UINT, 0);
 		m_d3d_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		m_d3d_context->DrawIndexed(static_cast<UINT>(geometry->index_count), 0, 0);
+		if (m_diagnostic_counters) ++m_diagnostic_counters->draws;
 	}
 	break;
 	case CompiledShaderType::Invalid:
@@ -2352,6 +2373,7 @@ static void SetBlurWeights(Rml::Vector4f& p_weights, float sigma)
 void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& source_destination, const Gfx::RenderTargetData& temp,
 	const Rml::Rectanglei window_flipped)
 {
+	if (m_diagnostic_counters) ++m_diagnostic_counters->blurs;
 	RMLUI_ASSERT(&source_destination != &temp && source_destination.width == temp.width && source_destination.height == temp.height);
 	RMLUI_ASSERT(window_flipped.Valid());
 
@@ -2842,7 +2864,7 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 	m_d3d_context->OMSetDepthStencilState(m_depth_stencil_state_stencil_test, m_stencil_ref_value);
 }
 
-RenderInterface_DX11::RenderLayerStack::RenderLayerStack()
+RenderInterface_DX11::RenderLayerStack::RenderLayerStack() : m_samples(NUM_MSAA_SAMPLES)
 {
 	m_rt_postprocess.resize(5);
 }
@@ -2868,7 +2890,7 @@ Rml::LayerHandle RenderInterface_DX11::RenderLayerStack::PushLayer()
 		ID3D11DepthStencilView* shared_depth_stencil = (m_rt_layers.empty() ? nullptr : m_rt_layers.front().depth_stencil_view);
 
 		m_rt_layers.push_back(Gfx::RenderTargetData{});
-		Gfx::CreateRenderTarget(m_d3d_device, m_rt_layers.back(), m_width, m_height, NUM_MSAA_SAMPLES, Gfx::RenderTargetAttachment::DepthStencil,
+		Gfx::CreateRenderTarget(m_d3d_device, m_rt_layers.back(), m_width, m_height, m_samples, Gfx::RenderTargetAttachment::DepthStencil,
 			shared_depth_stencil);
 	}
 
@@ -2917,6 +2939,16 @@ void RenderInterface_DX11::RenderLayerStack::BeginFrame(int new_width, int new_h
 	}
 
 	PushLayer();
+}
+
+void RenderInterface_DX11::RenderLayerStack::SetMsaaSamples(int samples)
+{
+	RMLUI_ASSERT(m_layers_size == 0);
+	if (m_samples != samples)
+	{
+		DestroyRenderTargets();
+		m_samples = samples;
+	}
 }
 
 void RenderInterface_DX11::RenderLayerStack::EndFrame()

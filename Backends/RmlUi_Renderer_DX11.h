@@ -46,6 +46,12 @@ public:
 
 	void SetViewport(int width, int height);
 	void RestorePartialRenderState();
+	// Change samples only outside BeginFrame/EndFrame; existing geometry remains valid.
+	bool SetMsaaSamples(int samples);
+	struct DiagnosticCounters {
+		uint64_t geometry_buffers = 0, resolves = 0, draws = 0, layers = 0, composites = 0, blurs = 0;
+	};
+	void SetDiagnosticCounters(DiagnosticCounters* counters) { m_diagnostic_counters = counters; }
 
 	// -- Inherited from Rml::RenderInterface --
 
@@ -90,6 +96,7 @@ public:
 	static constexpr Rml::TextureHandle TexturePostprocessNoBinding = Rml::TextureHandle(-3);
 
 private:
+	DiagnosticCounters* m_diagnostic_counters = nullptr;
 	// Changes blend state if necessary
 	void SetBlendState(ID3D11BlendState* blend_state);
 	void DisableBlend();
@@ -246,6 +253,7 @@ private:
 		~RenderLayerStack();
 
 		void SetD3DResources(ID3D11Device* device);
+		void SetMsaaSamples(int samples);
 
 		// Push a new layer. All references to previously retrieved layers are invalidated.
 		Rml::LayerHandle PushLayer();
@@ -273,6 +281,7 @@ private:
 		const Gfx::RenderTargetData& EnsureRenderTargetPostprocess(int index);
 
 		int m_width = 0, m_height = 0;
+		int m_samples;
 
 		// The number of active layers is manually tracked since we re-use the render targets stored in the fb_layers stack.
 		int m_layers_size = 0;
