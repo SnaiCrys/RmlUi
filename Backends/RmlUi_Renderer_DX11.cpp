@@ -2581,9 +2581,10 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	const Rml::Vector2i target_max = src_max * (1 << pass_level);
 	if (target_min != window_flipped.p0 || target_max != window_flipped.p1)
 	{
-		window_flipped_twice = VerticallyFlipped(scissor, m_viewport_height);
-		const Rml::Vector2i target_min_blit = window_flipped_twice.p0 * (1 << pass_level);
-		const Rml::Vector2i target_max_blit = window_flipped_twice.p1 * (1 << pass_level);
+		// Convert to DX coordinates only after scaling back to the full-resolution GL rectangle.
+		window_flipped_twice = VerticallyFlipped(Rml::Rectanglei::FromCorners(target_min, target_max), m_viewport_height);
+		const Rml::Vector2i target_min_blit = window_flipped_twice.p0;
+		const Rml::Vector2i target_max_blit = window_flipped_twice.p1;
 		BlitRenderTarget(temp, source_destination, src_min.x, src_min.y, src_max.x, src_max.y, target_min_blit.x, target_max_blit.y,
 			target_max_blit.x, target_min_blit.y);
 	}
