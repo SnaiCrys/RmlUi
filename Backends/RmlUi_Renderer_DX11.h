@@ -10,6 +10,7 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dxgi1_3.h>
+#include <vector>
 
 #ifdef RMLUI_DEBUG
 	#define RMLUI_DX_ASSERTMSG(statement, msg) RMLUI_ASSERTMSG(SUCCEEDED(statement), msg)
@@ -30,17 +31,23 @@ struct RenderTargetData;
 
 class RenderInterface_DX11 : public Rml::RenderInterface {
 public:
+	struct FrameRegions {
+		bool full = true;
+		bool opaque_background = false;
+		std::vector<Rml::Rectanglei> clear, output;
+	};
 	RenderInterface_DX11(ID3D11Device* p_d3d_device);
 	~RenderInterface_DX11() override;
 
-	// Set up DirectX 11 state for taking rendering commands from RmlUi.
-	void BeginFrame();
+	// Set up DirectX 11 state. Disable preservation only when the caller isolates the context state.
+	void BeginFrame(bool preserve_state = true, const FrameRegions* regions = nullptr);
 	// Render the finished result to the render target view and restore DirectX state.
 	void EndFrame(ID3D11RenderTargetView* p_render_target_view);
 	// Optionally clear the render target view before rendering.
 	void Clear(ID3D11RenderTargetView* p_render_target_view);
 
 	void SetViewport(int width, int height);
+	void SetSurfaceViewport(int logical_width, int logical_height, int raster_width, int raster_height);
 	void RestorePartialRenderState();
 	static constexpr int MsaaSamples = 4;
 
@@ -49,7 +56,11 @@ public:
 	void ReleaseSurfaceTarget(SurfaceTarget* target);
 	// Select outside BeginFrame/EndFrame. Targets retain their private stencil and scratch layers.
 	void SetSurfaceTarget(SurfaceTarget* target);
-	ID3D11ShaderResourceView* EndFrameTexture();
+	ID3D11ShaderResourceView* EndFrameTexture(ID3D11ShaderResourceView* foreground = nullptr);
+	bool SupportsForegroundCache() const;
+	// Returns an owned MSAA color snapshot, without retaining stencil or scratch targets.
+	ID3D11ShaderResourceView* SaveCurrentLayerMsaa();
+	void EndFrameWithoutResolve() { FinishFrame(); }
 	ID3D11RenderTargetView* GetCurrentRenderTarget() const;
 	ID3D11ShaderResourceView* GetCurrentLayerView() const;
 	void SetBackdropTexture(ID3D11ShaderResourceView* view) { m_backdrop_texture = view; }
@@ -102,6 +113,9 @@ public:
 	static constexpr Rml::TextureHandle TexturePostprocessNoBinding = Rml::TextureHandle(-3);
 
 private:
+	Rml::Rectanglei RasterBounds(Rml::Rectanglei bounds) const;
+	Rml::Vector2f m_raster_scale = {1, 1};
+	const FrameRegions* m_frame_regions = nullptr;
 	void FinishFrame();
 	// Changes blend state if necessary
 	void SetBlendState(ID3D11BlendState* blend_state);
@@ -124,7 +138,7 @@ private:
 	void DrawFullscreenQuad(Rml::Vector2f uv_offset, Rml::Vector2f uv_scaling = Rml::Vector2f(1.f));
 	void DrawQuad(Rml::Span<const Rml::Vertex> vertices);
 
-	void RenderBlur(float sigma, const Gfx::RenderTargetData& source_destination, const Gfx::RenderTargetData& temp, Rml::Rectanglei window_flipped);
+	void RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTargetData& source_destination, const Gfx::RenderTargetData& temp, Rml::Rectanglei window_flipped);
 
 	// D3D11 core resources
 	ID3D11Device* m_d3d_device = nullptr;
@@ -207,6 +221,7 @@ private:
 	};
 
 	D3D11State m_previous_d3d_state{};
+	bool m_preserve_state = true;
 
 #pragma pack(4)
 	union ShaderCbuffer {

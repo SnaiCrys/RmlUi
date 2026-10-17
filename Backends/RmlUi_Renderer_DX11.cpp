@@ -8,6 +8,7 @@
 #include <RmlUi/Core/MeshUtilities.h>
 #include <RmlUi/Core/Platform.h>
 #include <RmlUi/Core/SystemInterface.h>
+#include <cmath>
 
 // Helper for a common cleanup pattern in DX11
 template <typename T>
@@ -290,6 +291,21 @@ float4 PSMain(PS_Input input) : SV_TARGET {
 }
 )";
 
+static const char shader_frag_foreground_resolve[] = RMLUI_SHADER_HEADER R"(
+Texture2DMS<float4, 4> background : register(t0);
+Texture2DMS<float4, 4> foreground : register(t1);
+float4 PSMain(float4 position : SV_Position) : SV_TARGET {
+    const int2 pixel = int2(position.xy);
+    float4 result = 0;
+    [unroll] for (int sample = 0; sample < 4; ++sample) {
+        const float4 f = foreground.Load(pixel, sample);
+        const float4 color = f + background.Load(pixel, sample) * (1.0 - f.a);
+        result += color;
+    }
+    return result * 0.25;
+}
+)";
+
 static const char shader_frag_resolve[] = RMLUI_SHADER_HEADER R"(
 Texture2DMS<float4, 4> g_InputTexture : register(t0);
 
@@ -516,6 +532,7 @@ enum class ProgramId {
 	Blur,
 	DropShadow,
 	Resolve,
+	ForegroundResolve,
 	BlurPaired,
 	SurfaceBackdrop,
 	Count,
@@ -1055,6 +1072,8 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 	{
 		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::Resolve, VertShaderId::Passthrough,
 			shader_frag_resolve, sizeof(shader_frag_resolve));
+		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::ForegroundResolve, VertShaderId::Passthrough,
+			shader_frag_foreground_resolve, sizeof(shader_frag_foreground_resolve));
 		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::BlurPaired, VertShaderId::Blur,
 			shader_frag_blur_paired, sizeof(shader_frag_blur_paired));
 		program_data = std::move(mut_program_data);
@@ -1256,13 +1275,18 @@ RenderInterface_DX11::~RenderInterface_DX11()
 	Dx11CleanupResourceIfCreated(m_d3d_device);
 }
 
-void RenderInterface_DX11::BeginFrame()
+void RenderInterface_DX11::BeginFrame(bool preserve_state, const FrameRegions* regions)
 {
 	RMLUI_ASSERT(m_viewport_width >= 1 && m_viewport_height >= 1);
 	RMLUI_ASSERTMSG(m_d3d_context, "d3d_context cannot be nullptr!");
 	RMLUI_ASSERTMSG(m_d3d_device, "d3d_device cannot be nullptr!");
 
 	// Backup DX11 state
+	m_preserve_state = preserve_state;
+	m_frame_regions = regions;
+	if (regions && !regions->full && (!program_data->programs[ProgramId::Resolve].pixel_shader))
+		m_frame_regions = nullptr;
+	if (m_preserve_state)
 	{
 		m_previous_d3d_state.scissor_rects_count = m_previous_d3d_state.viewports_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
 		m_d3d_context->RSGetScissorRects(&m_previous_d3d_state.scissor_rects_count, m_previous_d3d_state.scissor_rects);
@@ -1310,7 +1334,17 @@ void RenderInterface_DX11::BeginFrame()
 	m_render_layers->BeginFrame(m_viewport_width, m_viewport_height);
 	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 	float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	m_d3d_context->ClearRenderTargetView(m_render_layers->GetTopLayer().render_target_view, clearColor);
+	if (!m_frame_regions || !m_frame_regions->opaque_background)
+	{
+		if (m_frame_regions && !m_frame_regions->full)
+		{
+			std::vector<D3D11_RECT> rectangles;
+			for (const auto& r : m_frame_regions->clear) rectangles.push_back({r.Left(), r.Top(), r.Right(), r.Bottom()});
+			if (!rectangles.empty()) m_d3d_context->ClearView(m_render_layers->GetTopLayer().render_target_view,
+				clearColor, rectangles.data(), UINT(rectangles.size()));
+		}
+		else m_d3d_context->ClearRenderTargetView(m_render_layers->GetTopLayer().render_target_view, clearColor);
+	}
 
 	UseProgram(ProgramId::None);
 	m_scissor_state = Rml::Rectanglei::MakeInvalid();
@@ -1319,6 +1353,38 @@ void RenderInterface_DX11::BeginFrame()
 void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view)
 {
 	RMLUI_ASSERTMSG(p_render_target_view, "p_render_target_view cannot be nullptr!");
+	if (m_frame_regions && !m_frame_regions->full)
+	{
+		if (m_frame_regions->output.empty()) { FinishFrame(); return; }
+		const auto& source = m_render_layers->GetTopLayer();
+		const auto& destination = m_render_layers->GetPostprocessPrimary();
+		ID3D11ShaderResourceView* null_views[2] = {};
+		// Resolve each non-overlapping output rectangle once; stale pixels outside it are never sampled.
+		m_d3d_context->PSSetShaderResources(0, 2, null_views);
+		Gfx::BindRenderTarget(m_d3d_context, destination);
+		DisableBlend();
+		UseProgram(ProgramId::Resolve);
+		// RenderGeometry unbinds t0 after each draw, including fullscreen quads.
+		for (const auto& region : m_frame_regions->output)
+		{
+			Gfx::BindTexture(m_d3d_context, source);
+			SetScissor(region);
+			DrawFullscreenQuad();
+		}
+		m_d3d_context->PSSetShaderResources(0, 2, null_views);
+		m_d3d_context->OMSetRenderTargets(1, &p_render_target_view, nullptr);
+		m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
+		SetBlendState(m_blend_state_enable);
+		UseProgram(ProgramId::Passthrough);
+		for (const auto& region : m_frame_regions->output)
+		{
+			Gfx::BindTexture(m_d3d_context, destination);
+			SetScissor(region);
+			DrawFullscreenQuad();
+		}
+		FinishFrame();
+		return;
+	}
 
 	const Gfx::RenderTargetData& rt_active = m_render_layers->GetTopLayer();
 	const Gfx::RenderTargetData& rt_postprocess = m_render_layers->GetPostprocessPrimary();
@@ -1343,12 +1409,14 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 
 void RenderInterface_DX11::FinishFrame()
 {
+	m_frame_regions = nullptr;
 	m_render_layers->EndFrame();
 
 	// Reset internal state
 	m_current_blend_state = nullptr;
 
 	// Restore modified DX state
+	if (m_preserve_state)
 	{
 		m_d3d_context->RSSetScissorRects(m_previous_d3d_state.scissor_rects_count, m_previous_d3d_state.scissor_rects);
 		m_d3d_context->RSSetViewports(m_previous_d3d_state.viewports_count, m_previous_d3d_state.viewports);
@@ -1844,14 +1912,31 @@ void RenderInterface_DX11::EnableScissorRegion(bool enable)
 
 void RenderInterface_DX11::SetScissorRegion(Rml::Rectanglei region)
 {
-	SetScissor(region);
+	SetScissor(RasterBounds(region));
 }
 
 void RenderInterface_DX11::SetViewport(const int width, const int height)
 {
 	m_viewport_width = width;
 	m_viewport_height = height;
+	m_raster_scale = {1, 1};
 	m_projection = Rml::Matrix4f::ProjectOrtho(0, (float)width, (float)height, 0, -10000, 10000);
+}
+
+void RenderInterface_DX11::SetSurfaceViewport(int logical_width, int logical_height, int raster_width, int raster_height)
+{
+	SetViewport(raster_width, raster_height);
+	m_raster_scale = {float(raster_width) / logical_width, float(raster_height) / logical_height};
+	m_projection = Rml::Matrix4f::ProjectOrtho(0, float(logical_width), float(logical_height), 0, -10000, 10000);
+}
+
+Rml::Rectanglei RenderInterface_DX11::RasterBounds(Rml::Rectanglei bounds) const
+{
+	if (!bounds.Valid() || m_raster_scale == Rml::Vector2f{1, 1}) return bounds;
+	const auto lower = [](float value) { return int(std::floor(Rml::Math::Clamp(value, -32768.f, 32767.f))); };
+	const auto upper = [](float value) { return int(std::ceil(Rml::Math::Clamp(value, -32768.f, 32767.f))); };
+	return Rml::Rectanglei::FromCorners({lower(bounds.Left() * m_raster_scale.x), lower(bounds.Top() * m_raster_scale.y)},
+		{upper(bounds.Right() * m_raster_scale.x), upper(bounds.Bottom() * m_raster_scale.y)});
 }
 
 void RenderInterface_DX11::Clear(ID3D11RenderTargetView* p_render_target_view)
@@ -2063,7 +2148,7 @@ bool RenderInterface_DX11::SupportsCompositeLayersWithInputBounds() const
 void RenderInterface_DX11::CompositeLayersWithInputBounds(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle,
 	Rml::BlendMode blend_mode, Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_bounds)
 {
-	CompositeLayersInternal(source_handle, destination_handle, blend_mode, filters, input_bounds);
+	CompositeLayersInternal(source_handle, destination_handle, blend_mode, filters, RasterBounds(input_bounds));
 }
 
 void RenderInterface_DX11::CompositeLayersInternal(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle,
@@ -2168,6 +2253,9 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 
 	// Copy the blitted content from the destination to the final texture
 	m_d3d_context->CopySubresourceRegion(texture_resource, 0, 0, 0, 0, destination.render_target_texture, 0, &copy_box);
+	// GenerateTexture({}, ...) leaves the mip chain empty until mip 0 has been copied.
+	// Minified saved layers (including cached box shadows/backgrounds) sample those levels.
+	m_d3d_context->GenerateMips(texture_view);
 
 	// Restore state and free memory
 	SetScissor(bounds);
@@ -2582,7 +2670,7 @@ static void SetBlurWeights(Rml::Vector4f& p_weights, float sigma)
 	p_weights.w = weights[3];
 }
 
-void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& source_destination, const Gfx::RenderTargetData& temp,
+void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTargetData& source_destination, const Gfx::RenderTargetData& temp,
 	const Rml::Rectanglei window_flipped)
 {
 	RMLUI_ASSERT(&source_destination != &temp && source_destination.width == temp.width && source_destination.height == temp.height);
@@ -2595,8 +2683,11 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	}
 
 	int pass_level = 0;
-	SigmaToParameters(sigma, pass_level, sigma);
-	if (sigma == 0)
+	float reduced_sigma = 0;
+	SigmaToParameters(Rml::Math::Max(sigma.x, sigma.y), pass_level, reduced_sigma);
+	sigma.x = Rml::Math::Clamp(sigma.x / float(1 << pass_level), 0.f, 3.f);
+	sigma.y = Rml::Math::Clamp(sigma.y / float(1 << pass_level), 0.f, 3.f);
+	if (sigma.x == 0 && sigma.y == 0)
 	{
 		// If sigma is zero we don't have anything to blur, so early exit since blurring will have no effect on the final image
 		return;
@@ -2678,20 +2769,22 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	// Get a pointer to the data in the constant buffer.
 	ShaderCbuffer* dataPtr = (ShaderCbuffer*)mappedResource.pData;
 
-	SetBlurWeights(dataPtr->blur.weights, sigma);
-	if (paired)
+	const auto set_weights = [&](ShaderCbuffer::Blur& data, float axis_sigma)
 	{
-		// Split the centre weight between the two inner pairs. Ratios are computed once per blur, not per pixel.
-		const Rml::Vector4f weights = dataPtr->blur.weights;
-		const float inner_weight = weights.x * 0.5f + weights.y;
-		const float outer_weight = weights.z + weights.w;
-		dataPtr->blur.paired_weights_offsets = {inner_weight, outer_weight, weights.y / inner_weight,
-			outer_weight > 0.f ? weights.w / outer_weight : 0.f};
-	}
+		SetBlurWeights(data.weights, axis_sigma);
+		if (paired)
+		{
+			const auto weights = data.weights;
+			const float inner = weights.x * .5f + weights.y, outer = weights.z + weights.w;
+			data.paired_weights_offsets = {inner, outer, weights.y / inner, outer > 0 ? weights.w / outer : 0};
+		}
+	};
+	set_weights(dataPtr->blur, sigma.y);
 	SetTexCoordLimits(dataPtr->blur.texcoord_min, dataPtr->blur.texcoord_max, scissor, {source_destination.width, source_destination.height});
 
 	Rml::Vector2f texel_offset = Rml::Vector2f(0.f, 1.f) * (1.0f / float(temp.height));
 	dataPtr->blur.texel_offset = texel_offset;
+	const auto horizontal_parameters = dataPtr->blur;
 
 	// Upload to the GPU.
 	m_d3d_context->Unmap(m_shader_buffer, 0);
@@ -2743,6 +2836,8 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	}
 
 	ShaderCbuffer::Blur* dataPtrBlur = (ShaderCbuffer::Blur*)mappedResource.pData;
+	*dataPtrBlur = horizontal_parameters;
+	set_weights(*dataPtrBlur, sigma.x);
 
 	texel_offset = Rml::Vector2f(1.f, 0.f) * (1.0f / float(source_destination.width));
 	dataPtrBlur->texel_offset = texel_offset;
@@ -2750,6 +2845,7 @@ void RenderInterface_DX11::RenderBlur(float sigma, const Gfx::RenderTargetData& 
 	// Upload to the GPU.
 	m_d3d_context->Unmap(m_blur_cbuffer, 0);
 	m_d3d_context->VSSetConstantBuffers(0, 1, &m_blur_cbuffer);
+	m_d3d_context->PSSetConstantBuffers(0, 1, &m_blur_cbuffer);
 
 	RenderGeometry(m_fullscreen_quad_geometry, {}, RenderInterface_DX11::TexturePostprocessNoBinding);
 
@@ -2829,7 +2925,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			const Gfx::RenderTargetData& temp = m_render_layers->GetPostprocessSecondary();
 
 			const Rml::Rectanglei window_flipped = VerticallyFlipped(m_scissor_state, m_viewport_height);
-			RenderBlur(filter.sigma, source_destination, temp, window_flipped);
+			RenderBlur(m_raster_scale * filter.sigma, source_destination, temp, window_flipped);
 
 			SetBlendState(blend_state_backup);
 		}
@@ -2873,13 +2969,13 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			m_cbuffer_dirty = true;
 
-			const Rml::Vector2f uv_offset = filter.offset / Rml::Vector2f(-(float)m_viewport_width, (float)m_viewport_height);
+			const Rml::Vector2f uv_offset = (filter.offset * m_raster_scale) / Rml::Vector2f(-(float)m_viewport_width, (float)m_viewport_height);
 			DrawFullscreenQuad(uv_offset);
 
 			if (filter.sigma >= 0.5f)
 			{
 				const Gfx::RenderTargetData& tertiary = m_render_layers->GetPostprocessTertiary();
-				RenderBlur(filter.sigma, secondary, tertiary, window_flipped);
+				RenderBlur(m_raster_scale * filter.sigma, secondary, tertiary, window_flipped);
 			}
 
 			UseProgram(ProgramId::Passthrough);
@@ -3121,13 +3217,53 @@ ID3D11ShaderResourceView* RenderInterface_DX11::GetCurrentLayerView() const
 	return m_render_layers->GetTopLayer().render_target_shader_resource_view;
 }
 
-ID3D11ShaderResourceView* RenderInterface_DX11::EndFrameTexture()
+ID3D11ShaderResourceView* RenderInterface_DX11::EndFrameTexture(ID3D11ShaderResourceView* foreground)
 {
 	const auto& active = m_render_layers->GetTopLayer();
 	const auto& resolved = m_render_layers->GetPostprocessPrimary();
+	if (foreground && SupportsForegroundCache())
+	{
+		ID3D11ShaderResourceView* null_views[2] = {};
+		m_d3d_context->PSSetShaderResources(0, 2, null_views);
+		Gfx::BindRenderTarget(m_d3d_context, resolved);
+		Gfx::BindTexture(m_d3d_context, active);
+		m_d3d_context->PSSetShaderResources(1, 1, &foreground);
+		EnableClipMask(false);
+		SetScissor(Rml::Rectanglei::MakeInvalid());
+		DisableBlend();
+		UseProgram(ProgramId::ForegroundResolve);
+		DrawFullscreenQuad();
+		m_d3d_context->PSSetShaderResources(0, 2, null_views);
+	}
+	else
 	m_d3d_context->ResolveSubresource(resolved.render_target_texture, 0, active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
 	auto view = resolved.render_target_shader_resource_view;
 	FinishFrame();
+	return view;
+}
+
+bool RenderInterface_DX11::SupportsForegroundCache() const
+{
+	return program_data && program_data->programs[ProgramId::ForegroundResolve].pixel_shader;
+}
+
+ID3D11ShaderResourceView* RenderInterface_DX11::SaveCurrentLayerMsaa()
+{
+	const auto& source = m_render_layers->GetTopLayer();
+	D3D11_TEXTURE2D_DESC desc{};
+	source.render_target_texture->GetDesc(&desc);
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	ID3D11Texture2D* snapshot = nullptr;
+	if (FAILED(m_d3d_device->CreateTexture2D(&desc, nullptr, &snapshot))) return nullptr;
+	ID3D11ShaderResourceView* view = nullptr;
+	const HRESULT hr = m_d3d_device->CreateShaderResourceView(snapshot, nullptr, &view);
+	if (SUCCEEDED(hr))
+	{
+		m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
+		m_d3d_context->CopyResource(snapshot, source.render_target_texture);
+		Gfx::BindRenderTarget(m_d3d_context, source);
+	}
+	snapshot->Release();
 	return view;
 }
 
