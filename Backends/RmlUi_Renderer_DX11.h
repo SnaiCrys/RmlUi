@@ -38,6 +38,7 @@ public:
 	};
 	RenderInterface_DX11(ID3D11Device* p_d3d_device);
 	~RenderInterface_DX11() override;
+	bool IsValid() const { return m_valid; }
 
 	// Set up DirectX 11 state. Disable preservation only when the caller isolates the context state.
 	void BeginFrame(bool preserve_state = true, const FrameRegions* regions = nullptr);
@@ -113,6 +114,7 @@ public:
 	static constexpr Rml::TextureHandle TexturePostprocessNoBinding = Rml::TextureHandle(-3);
 
 private:
+	bool m_valid = false;
 	Rml::Rectanglei RasterBounds(Rml::Rectanglei bounds) const;
 	Rml::Vector2f m_raster_scale = {1, 1};
 	const FrameRegions* m_frame_regions = nullptr;

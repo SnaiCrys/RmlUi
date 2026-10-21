@@ -942,19 +942,21 @@ static void DestroyShaders(const ProgramData& data)
 
 RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 {
-	RMLUI_ASSERTMSG(p_d3d_device, "p_d3d_device cannot be nullptr!");
+	if (!p_d3d_device || p_d3d_device->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0) return;
 
 	// Assign D3D resources
 	m_d3d_device = p_d3d_device;
 	m_d3d_device->AddRef();
-	m_d3d_device->QueryInterface(__uuidof(ID3D11Device1), (void**)&m_d3d_device_1);
+	if (FAILED(m_d3d_device->QueryInterface(__uuidof(ID3D11Device1), (void**)&m_d3d_device_1))) return;
 	m_d3d_device_1->GetImmediateContext1(&m_d3d_context);
+	if (!m_d3d_context) return;
 	m_render_layers->SetD3DResources(m_d3d_device);
 
 	// Pre-cache quad for blitting
 	Rml::Mesh mesh;
 	Rml::MeshUtilities::GenerateQuad(mesh, Rml::Vector2f(-1), Rml::Vector2f(2), {});
 	m_fullscreen_quad_geometry = RenderInterface_DX11::CompileGeometry(mesh.vertices, mesh.indices);
+	if (!m_fullscreen_quad_geometry) return;
 
 	D3D11_BUFFER_DESC quad_desc{};
 	quad_desc.ByteWidth = 4 * sizeof(Rml::Vertex);
@@ -990,25 +992,21 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 		HRESULT result = m_d3d_device->CreateBlendState(&blend_desc, &m_blend_state_enable);
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateBlendState");
-#ifdef RMLUI_DX_DEBUG
 		if (FAILED(result))
 		{
 			Rml::Log::Message(Rml::Log::LT_ERROR, "ID3D11Device::CreateBlendState (%d)", result);
 			return;
 		}
-#endif
 
 		ZeroMemory(&blend_desc, sizeof(blend_desc));
 		blend_desc.RenderTarget[0].RenderTargetWriteMask = 0;
 		result = m_d3d_device->CreateBlendState(&blend_desc, &m_blend_state_disable_color);
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateBlendState");
-#ifdef RMLUI_DX_DEBUG
 		if (FAILED(result))
 		{
 			Rml::Log::Message(Rml::Log::LT_ERROR, "ID3D11Device::CreateBlendState (%d)", result);
 			return;
 		}
-#endif
 
 		blend_desc.RenderTarget[0].BlendEnable = true;
 		blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
@@ -1020,13 +1018,11 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 		result = m_d3d_device->CreateBlendState(&blend_desc, &m_blend_state_color_filter);
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateBlendState");
-#ifdef RMLUI_DX_DEBUG
 		if (FAILED(result))
 		{
 			Rml::Log::Message(Rml::Log::LT_ERROR, "ID3D11Device::CreateBlendState (%d)", result);
 			return;
 		}
-#endif
 	}
 
 	// Scissor regions require a rasterizer state. Cache one for scissor on and off
@@ -1045,25 +1041,21 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 
 		HRESULT result = m_d3d_device->CreateRasterizerState(&rasterizerDesc, &m_rasterizer_state_scissor_enabled);
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateRasterizerState");
-#ifdef RMLUI_DX_DEBUG
 		if (FAILED(result))
 		{
 			Rml::Log::Message(Rml::Log::LT_ERROR, "ID3D11Device::CreateRasterizerState (scissor: enabled) (%d)", result);
 			return;
 		}
-#endif
 
 		rasterizerDesc.ScissorEnable = false;
 
 		result = m_d3d_device->CreateRasterizerState(&rasterizerDesc, &m_rasterizer_state_scissor_disabled);
 		RMLUI_DX_ASSERTMSG(result, "failed to CreateRasterizerState");
-#ifdef RMLUI_DX_DEBUG
 		if (FAILED(result))
 		{
 			Rml::Log::Message(Rml::Log::LT_ERROR, "ID3D11Device::CreateRasterizerState (scissor: disabled) (%d)", result);
 			return;
 		}
-#endif
 	}
 
 	// Compile and load shaders
@@ -1077,6 +1069,11 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::BlurPaired, VertShaderId::Blur,
 			shader_frag_blur_paired, sizeof(shader_frag_blur_paired));
 		program_data = std::move(mut_program_data);
+	}
+	else
+	{
+		Gfx::DestroyShaders(*mut_program_data);
+		return;
 	}
 
 	// Create vertex layout. This will be constant to avoid copying to an intermediate struct.
@@ -1205,7 +1202,7 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		desc.BackFace = desc.FrontFace;
 		desc.StencilEnable = true;
 		// Disabled
-		m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_disable);
+		if (FAILED(m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_disable))) return;
 
 		desc.StencilEnable = true;
 		desc.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
@@ -1216,7 +1213,7 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
 		desc.BackFace = desc.FrontFace;
 		// Set and SetInverse
-		m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_stencil_set);
+		if (FAILED(m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_stencil_set))) return;
 
 		desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
 		desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_INCR;
@@ -1224,7 +1221,7 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
 		desc.BackFace = desc.FrontFace;
 		// Intersect
-		m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_stencil_intersect);
+		if (FAILED(m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_stencil_intersect))) return;
 
 		desc.StencilWriteMask = 0;
 		desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
@@ -1233,8 +1230,9 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
 		desc.BackFace = desc.FrontFace;
 		// Stencil test
-		m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_stencil_test);
+		if (FAILED(m_d3d_device->CreateDepthStencilState(&desc, &m_depth_stencil_state_stencil_test))) return;
 	}
+	m_valid = true;
 }
 
 RenderInterface_DX11::~RenderInterface_DX11()
