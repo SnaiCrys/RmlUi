@@ -19,6 +19,8 @@ public:
 	Texture() = default;
 
 	Vector2i GetDimensions() const;
+	/// The resolved file source, or empty for callback textures. Does not load the texture.
+	String GetSource() const;
 
 	explicit operator bool() const;
 	bool operator==(const Texture& other) const;

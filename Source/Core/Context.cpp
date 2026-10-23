@@ -23,6 +23,20 @@
 
 namespace Rml {
 
+void Context::GetTextureSources(StringList& sources)
+{
+	auto visit = [&sources](auto&& self, Element* element) -> void {
+		element->GetTextureSources(sources);
+		for (int i = 0; i < element->GetNumChildren(true); ++i)
+			self(self, element->GetChild(i));
+	};
+	for (int i = 0; i < GetNumDocuments(); ++i)
+	{
+		auto document = GetDocument(i);
+		if (document->IsVisible()) visit(visit, document);
+	}
+}
+
 static constexpr float DOUBLE_CLICK_TIME = 0.5f;    // [s]
 static constexpr float DOUBLE_CLICK_MAX_DIST = 3.f; // [dp]
 static constexpr float UNIT_SCROLL_LENGTH = 80.f;   // [dp]

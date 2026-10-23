@@ -11,6 +11,15 @@ Decorator::Decorator() {}
 
 Decorator::~Decorator() {}
 
+void Decorator::GetTextureSources(StringList& sources) const
+{
+	for (int i = 0; i < GetNumTextures(); ++i)
+	{
+		auto source = GetTexture(i).GetSource();
+		if (!source.empty()) sources.push_back(std::move(source));
+	}
+}
+
 int Decorator::AddTexture(Texture texture)
 {
 	if (!texture)

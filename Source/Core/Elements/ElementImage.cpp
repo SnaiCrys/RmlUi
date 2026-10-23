@@ -75,6 +75,14 @@ void ElementImage::EnsureSourceLoaded()
 		LoadTexture();
 }
 
+void ElementImage::GetTextureSources(StringList& sources)
+{
+	Element::GetTextureSources(sources);
+	EnsureSourceLoaded();
+	auto source = texture.GetSource();
+	if (!source.empty()) sources.push_back(std::move(source));
+}
+
 void ElementImage::OnRender()
 {
 	// Regenerate the geometry if required (this will be set if 'rect' changes but does not result in a resize).

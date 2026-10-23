@@ -103,8 +103,15 @@ TextureFileIndex FileTextureDatabase::InsertTexture(const String& source)
 	const auto index = TextureFileIndex(texture_list.size());
 	texture_map[source] = index;
 	texture_list.push_back({});
+	texture_sources.push_back(source);
 
 	return index;
+}
+
+String FileTextureDatabase::GetSource(TextureFileIndex index) const
+{
+	RMLUI_ASSERT(size_t(index) < texture_sources.size());
+	return texture_sources[size_t(index)];
 }
 
 FileTextureDatabase::FileTextureEntry FileTextureDatabase::LoadTextureEntry(RenderInterface* render_interface, const String& source)

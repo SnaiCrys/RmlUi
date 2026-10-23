@@ -26,6 +26,7 @@ private:
 	static void Render(RenderManager* render_manager, const Geometry& geometry, Vector2f translation, Texture texture, const CompiledShader& shader);
 
 	static void GetTextureSourceList(RenderManager* render_manager, StringList& source_list);
+	static String GetTextureSource(RenderManager* render_manager, TextureFileIndex index);
 	static const Mesh& GetMesh(RenderManager* render_manager, const Geometry& geometry);
 
 	static bool ReleaseTexture(RenderManager* render_manager, const String& texture_source);

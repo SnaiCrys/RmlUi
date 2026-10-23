@@ -42,6 +42,7 @@ public:
 	~FileTextureDatabase();
 
 	TextureFileIndex InsertTexture(const String& source);
+	String GetSource(TextureFileIndex index) const;
 
 	TextureHandle GetHandle(RenderInterface* render_interface, TextureFileIndex index);
 	Vector2i GetDimensions(RenderInterface* render_interface, TextureFileIndex index);
@@ -62,6 +63,7 @@ private:
 	FileTextureEntry& EnsureLoaded(RenderInterface* render_interface, TextureFileIndex index);
 
 	Vector<FileTextureEntry> texture_list;
+	Vector<String> texture_sources;
 	UnorderedMap<String, TextureFileIndex> texture_map; // key: source, value: index into 'texture_list'
 };
 

@@ -4,6 +4,11 @@
 
 namespace Rml {
 
+String RenderManagerAccess::GetTextureSource(RenderManager* render_manager, TextureFileIndex index)
+{
+	return render_manager->GetTextureSource(index);
+}
+
 Vector2i RenderManagerAccess::GetDimensions(RenderManager* render_manager, TextureFileIndex texture)
 {
 	return render_manager->texture_database->file_database.GetDimensions(render_manager->render_interface, texture);

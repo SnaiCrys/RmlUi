@@ -21,6 +21,7 @@ public:
 	~ElementEffects();
 
 	void InstanceEffects();
+	void GetTextureSources(StringList& sources) const;
 
 	void RenderEffects(RenderStage render_stage);
 	void ExtendSurfaceInkOverflow(Rectanglef& bounds);

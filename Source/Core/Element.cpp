@@ -178,6 +178,11 @@ void Element::UpdateProperties(const float dp_ratio, const Vector2f vp_dimension
 	}
 }
 
+void Element::GetTextureSources(StringList& sources)
+{
+	meta->effects.GetTextureSources(sources);
+}
+
 void Element::Render()
 {
 #ifdef RMLUI_TRACY_PROFILING

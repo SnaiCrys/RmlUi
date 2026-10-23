@@ -109,6 +109,9 @@ public:
 	ElementDocument* GetDocument(int index);
 	/// Returns the number of documents in the context.
 	int GetNumDocuments() const;
+	/// Appends file texture sources referenced by shown documents, including non-DOM children.
+	/// Call after Update(). Ignores clipping and child visibility; never loads image pixels.
+	void GetTextureSources(StringList& sources);
 
 	/// Returns the hover element.
 	/// @return The element the mouse cursor is hovering over.

@@ -45,6 +45,7 @@ public:
 
 	/// Loads the current source file if needed. This normally happens automatically during layouting.
 	void EnsureSourceLoaded();
+	void GetTextureSources(StringList& sources) override;
 
 protected:
 	/// Renders the image.

@@ -18,6 +18,13 @@ ElementEffects::~ElementEffects()
 	ReleaseEffects();
 }
 
+void ElementEffects::GetTextureSources(StringList& sources) const
+{
+	for (const auto* list : {&decorators, &mask_images})
+		for (const auto& entry : *list)
+			entry.decorator->GetTextureSources(sources);
+}
+
 void ElementEffects::InstanceEffects()
 {
 	if (!effects_dirty)

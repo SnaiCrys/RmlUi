@@ -43,6 +43,9 @@ public:
 	/// @note This value will prevent the decorator from being rendered on the given element.
 	static const DecoratorDataHandle INVALID_DECORATORDATAHANDLE = 0;
 
+	/// Appends resolved file sources without generating element data or loading pixels.
+	void GetTextureSources(StringList& sources) const;
+
 protected:
 	/// Adds a texture if it is valid into the list of textures in use by the decorator.
 	/// @param[in] texture The texture to add.

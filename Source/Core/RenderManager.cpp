@@ -299,6 +299,11 @@ void RenderManager::GetTextureSourceList(StringList& source_list) const
 	texture_database->file_database.GetSourceList(source_list);
 }
 
+String RenderManager::GetTextureSource(TextureFileIndex index) const
+{
+	return texture_database->file_database.GetSource(index);
+}
+
 const Mesh& RenderManager::GetMesh(const Geometry& geometry) const
 {
 	RMLUI_ASSERT(geometry.render_manager == this && geometry.resource_handle != geometry.InvalidHandle());

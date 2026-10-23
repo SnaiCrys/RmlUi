@@ -31,6 +31,13 @@ ElementProgress::ElementProgress(const String& tag) :
 
 ElementProgress::~ElementProgress() {}
 
+void ElementProgress::GetTextureSources(StringList& sources)
+{
+	Element::GetTextureSources(sources);
+	auto source = texture.GetSource();
+	if (!source.empty()) sources.push_back(std::move(source));
+}
+
 float ElementProgress::GetValue() const
 {
 	const float max_value = GetMax();

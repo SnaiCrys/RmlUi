@@ -16,6 +16,13 @@ Vector2i Texture::GetDimensions() const
 	return {};
 }
 
+String Texture::GetSource() const
+{
+	if (file_index != TextureFileIndex::Invalid)
+		return RenderManagerAccess::GetTextureSource(render_manager, file_index);
+	return {};
+}
+
 Texture::operator bool() const
 {
 	return callback_index != StableVectorIndex::Invalid || file_index != TextureFileIndex::Invalid;

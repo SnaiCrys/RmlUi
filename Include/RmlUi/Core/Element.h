@@ -594,6 +594,10 @@ public:
 	/// Return the computed values of the element's properties. These values are updated as appropriate on every Context::Update.
 	const ComputedValues& GetComputedValues() const;
 
+	/// Appends this element's own resolved file texture sources, without loading pixels.
+	/// Call after Context::Update; does not include child elements.
+	virtual void GetTextureSources(StringList& sources);
+
 protected:
 	void Update(float dp_ratio, Vector2f vp_dimensions);
 	void Render();
