@@ -15,6 +15,7 @@ using ScriptObject = void*;
 
 enum class Character : char32_t { Null, Replacement = 0xfffd }; // Unicode code point
 enum class BoxArea { Margin, Border, Padding, Content, Auto };
+enum class RenderPass { Screen, World };
 
 } // namespace Rml
 

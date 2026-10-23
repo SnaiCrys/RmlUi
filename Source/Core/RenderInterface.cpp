@@ -23,6 +23,7 @@ void RenderInterface::RenderToClipMask(ClipMaskOperation /*operation*/, Compiled
 
 void RenderInterface::SetTransform(const Matrix4f* /*transform*/) {}
 
+void RenderInterface::SetRenderPass(RenderPass /*pass*/) {}
 SurfaceRenderMode RenderInterface::BeginRenderSurface(uintptr_t /*id*/, Rectanglef /*border_box*/, Rectanglei /*paint_bounds*/) { return SurfaceRenderMode::Default; }
 void RenderInterface::EndRenderSurface() {}
 void RenderInterface::BeginBackdropFilter() {}
@@ -33,6 +34,11 @@ void RenderInterface::EndTextureGeneration() {}
 LayerHandle RenderInterface::PushLayer()
 {
 	return {};
+}
+
+LayerHandle RenderInterface::PushLayerWithBounds(Rectanglei /*bounds*/)
+{
+	return PushLayer();
 }
 
 void RenderInterface::CompositeLayers(LayerHandle /*source*/, LayerHandle /*destination*/, BlendMode /*blend_mode*/,

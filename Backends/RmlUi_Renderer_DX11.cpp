@@ -9,6 +9,7 @@
 #include <RmlUi/Core/Platform.h>
 #include <RmlUi/Core/SystemInterface.h>
 #include <cmath>
+#include <mutex>
 
 // Helper for a common cleanup pattern in DX11
 template <typename T>
@@ -41,6 +42,16 @@ static void Dx11CleanupResourceIfCreated(T*& resource)
 #define RMLUI_STRINGIFY(x) RMLUI_STRINGIFY_IMPL(x)
 
 #define RMLUI_SHADER_HEADER "#define MAX_NUM_STOPS " RMLUI_STRINGIFY(MAX_NUM_STOPS) "\n#line " RMLUI_STRINGIFY(__LINE__) "\n"
+
+#define RMLUI_SHADER_SAMPLING                                                                                                                       \
+	"cbuffer RenderSampling : register(b2) { float4 rml_uv_transform; float4 rml_uv_limits; };\n"                                                   \
+	"float2 RmlValidUv(float2 uv) { return clamp(uv, rml_uv_limits.xy, rml_uv_limits.zw); }\n"                                                      \
+	"float RmlBorderWeight(float2 uv) { float2 texel = 2 * rml_uv_limits.xy; float2 a = saturate(1 + (uv - rml_uv_limits.xy) / texel); float2 b = " \
+	"saturate(1 + (rml_uv_limits.zw - uv) / texel); return a.x * a.y * b.x * b.y; }\n"                                                              \
+	"#define RmlSample(tex, samp, uv) (all(abs(rml_uv_limits.xy + rml_uv_limits.zw - 1) < 0.000001) ? tex.Sample(samp, uv) : tex.Sample(samp, "     \
+	"RmlValidUv(uv)) * RmlBorderWeight(uv))\n"                                                                                                      \
+	"#define RmlSampleLevel(tex, samp, uv, lod) (all(abs(rml_uv_limits.xy + rml_uv_limits.zw - 1) < 0.000001) ? tex.SampleLevel(samp, uv, lod) : "  \
+	"tex.SampleLevel(samp, RmlValidUv(uv), lod) * RmlBorderWeight(uv))\n"
 
 constexpr const char shader_vert_main[] = RMLUI_SHADER_HEADER R"(
 struct VS_Input
@@ -231,7 +242,7 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
 };
 )";
 
-constexpr const char shader_vert_passthrough[] = RMLUI_SHADER_HEADER R"(
+constexpr const char shader_vert_passthrough[] = RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING R"(
 struct VS_Input
 {
     float2 position : POSITION;
@@ -258,12 +269,14 @@ PS_Input VSMain(const VS_Input IN)
 
     result.position = float4(IN.position.xy, 0.0f, 1.0f);
     result.uv = float2(IN.uv.x, 1.0f - IN.uv.y);
+    if (any(rml_uv_transform.xy != 1) || any(rml_uv_transform.zw != 0))
+        result.uv = result.uv * rml_uv_transform.xy + rml_uv_transform.zw;
 
     return result;
 };
 )";
 
-constexpr const char shader_frag_passthrough[] = RMLUI_SHADER_HEADER R"(
+constexpr const char shader_frag_passthrough[] = RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING R"(
 struct PS_Input
 {
     float4 position : SV_Position;
@@ -276,18 +289,20 @@ SamplerState g_SamplerLinear : register(s0);
 
 float4 PSMain(const PS_Input IN) : SV_TARGET
 {
-    return g_InputTexture.Sample(g_SamplerLinear, IN.uv);
+    return RmlSample(g_InputTexture, g_SamplerLinear, IN.uv);
 };
 )";
 
-constexpr const char shader_frag_surface_backdrop[] = RMLUI_SHADER_HEADER R"(
+constexpr const char shader_frag_surface_backdrop[] = RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING R"(
 struct PS_Input { float4 position : SV_Position; float4 color : COLOR; float2 uv : TEXCOORD; };
 Texture2D foreground : register(t0);
 Texture2D background : register(t1);
 SamplerState linearClamp : register(s0);
+cbuffer SurfaceMapping : register(b1) { float4 m_backdrop_mapping; };
 float4 PSMain(PS_Input input) : SV_TARGET {
-    float4 color = foreground.Sample(linearClamp, input.uv);
-    return color + background.Sample(linearClamp, input.uv) * (1.0 - color.a);
+    float4 color = RmlSample(foreground, linearClamp, input.uv);
+    const float2 uv = (input.position.xy + m_backdrop_mapping.xy) * m_backdrop_mapping.zw;
+    return color + background.Sample(linearClamp, uv) * (1.0 - color.a);
 }
 )";
 
@@ -317,7 +332,19 @@ float4 PSMain(float4 position : SV_Position) : SV_TARGET
 };
 )";
 
-static const char shader_frag_color_matrix[] = RMLUI_SHADER_HEADER R"(
+// Same MSAA resolve, with integer addressing for a cropped working target.
+static const char shader_frag_resolve_region[] = RMLUI_SHADER_HEADER R"(
+Texture2DMS<float4, 4> g_InputTexture : register(t0);
+cbuffer ResolveRegion : register(b1) { int2 source_offset; };
+float4 PSMain(float4 position : SV_Position) : SV_TARGET
+{
+    const int2 pixel = int2(position.xy) + source_offset;
+    return (g_InputTexture.Load(pixel, 0) + g_InputTexture.Load(pixel, 1)
+        + g_InputTexture.Load(pixel, 2) + g_InputTexture.Load(pixel, 3)) * 0.25f;
+};
+)";
+
+static const char shader_frag_color_matrix[] = RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING R"(
 
 Texture2D g_InputTexture : register(t0);
 SamplerState g_SamplerLinear : register(s0);
@@ -342,16 +369,17 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
     // In the general case we should do the matrix transformation in non-premultiplied space. However, without alpha
     // transformations, we can do it directly in premultiplied space to avoid the extra division and multiplication
     // steps. In this space, the constant term needs to be multiplied by the alpha value, instead of unity.
-    float4 texColor = g_InputTexture.Sample(g_SamplerLinear, IN.uv);
+    float4 texColor = RmlSample(g_InputTexture, g_SamplerLinear, IN.uv);
     float3 transformedColor = mul(m_color_matrix, texColor).rgb;
     return float4(transformedColor, texColor.a);
 };
 )";
 
-static const char shader_frag_blend_mask[] = RMLUI_SHADER_HEADER R"(
+static const char shader_frag_blend_mask[] = RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING R"(
 Texture2D g_InputTexture : register(t0);
 Texture2D g_MaskTexture : register(t1);
 SamplerState g_SamplerLinear : register(s0);
+cbuffer MaskMapping : register(b1) { float4 m_mask_mapping; float4 m_mask_limit; };
 
 struct PS_Input
 {
@@ -362,14 +390,16 @@ struct PS_Input
 
 float4 PSMain(const PS_Input IN) : SV_TARGET
 {
-    float4 texColor = g_InputTexture.Sample(g_SamplerLinear, IN.uv);
-    float maskAlpha = g_MaskTexture.Sample(g_SamplerLinear, IN.uv).a;
+    float4 texColor = RmlSample(g_InputTexture, g_SamplerLinear, IN.uv);
+    float2 uv=(IN.position.xy+m_mask_mapping.xy)*m_mask_mapping.zw;
+    float maskAlpha = all(uv>=0) && all(uv<m_mask_limit.xy) ? g_MaskTexture.Sample(g_SamplerLinear,uv).a : 0;
     return texColor * maskAlpha;
 };
 )";
 
-#define RMLUI_SHADER_BLUR_HEADER \
-	RMLUI_SHADER_HEADER "\n#define BLUR_SIZE " RMLUI_STRINGIFY(BLUR_SIZE) "\n#define BLUR_NUM_WEIGHTS " RMLUI_STRINGIFY(BLUR_NUM_WEIGHTS)
+#define RMLUI_SHADER_BLUR_HEADER              \
+	RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING \
+		"\n#define BLUR_SIZE " RMLUI_STRINGIFY(BLUR_SIZE) "\n#define BLUR_NUM_WEIGHTS " RMLUI_STRINGIFY(BLUR_NUM_WEIGHTS)
 
 static const char shader_vert_blur[] = RMLUI_SHADER_BLUR_HEADER R"(
 struct VS_Input
@@ -399,8 +429,11 @@ PS_INPUT VSMain(const VS_Input IN)
 {
     PS_INPUT result = (PS_INPUT)0;
 
+    float2 uv = IN.uv;
+    if (any(rml_uv_transform.xy != 1))
+        uv = float2(IN.uv.x * rml_uv_transform.x, 1.0f - rml_uv_transform.y + IN.uv.y * rml_uv_transform.y);
     for (int i = 0; i < BLUR_SIZE; i++) {
-        result.uv[i] = IN.uv - float(i - BLUR_NUM_WEIGHTS + 1) * m_texelOffset;
+        result.uv[i] = uv - float(i - BLUR_NUM_WEIGHTS + 1) * m_texelOffset;
     }
     result.position = float4(IN.position.xy, 1.0, 1.0);
 
@@ -434,7 +467,7 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
     for(int i = 0; i < BLUR_SIZE; i++)
     {
         float2 in_region = step(m_texCoordMin, IN.uv[i]) * step(IN.uv[i], m_texCoordMax);
-        color += g_InputTexture.Sample(g_SamplerLinear, float2(IN.uv[i].x, 1.0f - IN.uv[i].y)) * in_region.x * in_region.y * m_weights[abs(i - BLUR_NUM_WEIGHTS + 1)];
+        color += RmlSample(g_InputTexture, g_SamplerLinear, float2(IN.uv[i].x, 1.0f - IN.uv[i].y)) * in_region.x * in_region.y * m_weights[abs(i - BLUR_NUM_WEIGHTS + 1)];
     }
     return color;
 };
@@ -463,7 +496,7 @@ struct PS_Input
 
 float4 SampleBlur(float2 uv)
 {
-    return g_InputTexture.SampleLevel(g_SamplerLinear, float2(uv.x, 1.0f - uv.y), 0);
+    return RmlSampleLevel(g_InputTexture, g_SamplerLinear, float2(uv.x, 1.0f - uv.y), 0);
 }
 
 float4 PSMain(const PS_Input IN) : SV_TARGET
@@ -495,7 +528,7 @@ float4 PSMain(const PS_Input IN) : SV_TARGET
 };
 )";
 
-static const char shader_frag_drop_shadow[] = RMLUI_SHADER_HEADER R"(
+static const char shader_frag_drop_shadow[] = RMLUI_SHADER_HEADER RMLUI_SHADER_SAMPLING R"(
 Texture2D g_InputTexture : register(t0);
 SamplerState g_SamplerLinear : register(s0);
 
@@ -516,7 +549,7 @@ struct PS_Input
 float4 PSMain(const PS_Input IN) : SV_TARGET
 {
     float2 in_region = step(m_texCoordMin, IN.uv) * step(IN.uv, m_texCoordMax);
-    return g_InputTexture.Sample(g_SamplerLinear, IN.uv).a * in_region.x * in_region.y * m_color;
+    return RmlSample(g_InputTexture, g_SamplerLinear, IN.uv).a * in_region.x * in_region.y * m_color;
 };
 )";
 
@@ -532,6 +565,7 @@ enum class ProgramId {
 	Blur,
 	DropShadow,
 	Resolve,
+	ResolveRegion,
 	ForegroundResolve,
 	BlurPaired,
 	SurfaceBackdrop,
@@ -715,7 +749,14 @@ static bool CreateProgram(ID3D11Device* p_device, ShaderProgram& out_program, ID
 	return true;
 }
 
+struct StencilState {
+	uint64_t generation = 0;
+	Rml::Vector2i origin = {}, size = {};
+};
+
 struct RenderTargetData {
+	Rml::Rectanglei bounds = Rml::Rectanglei::MakeInvalid();
+	Rml::SharedPtr<StencilState> stencil;
 	int width = 0, height = 0;
 	UINT sample_count = 1;
 	ID3D11RenderTargetView* render_target_view = nullptr;                   // To write to colour attachment buffer
@@ -838,6 +879,8 @@ static bool CreateRenderTarget(ID3D11Device* p_device, RenderTargetData& out_rt,
 	}
 
 	out_rt = {};
+	out_rt.bounds = Rml::Rectanglei::FromSize({width, height});
+	out_rt.stencil = depth_stencil_view ? Rml::MakeShared<StencilState>() : nullptr;
 	out_rt.width = width;
 	out_rt.height = height;
 	out_rt.sample_count = texture_desc.SampleDesc.Count;
@@ -951,6 +994,7 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 	m_d3d_device_1->GetImmediateContext1(&m_d3d_context);
 	if (!m_d3d_context) return;
 	m_render_layers->SetD3DResources(m_d3d_device);
+	m_surface_render_layers.SetD3DResources(m_d3d_device);
 
 	// Pre-cache quad for blitting
 	Rml::Mesh mesh;
@@ -1058,22 +1102,34 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		}
 	}
 
-	// Compile and load shaders
-	auto mut_program_data = Rml::MakeUnique<Gfx::ProgramData>();
-	if (Gfx::CreateShaders(m_d3d_device, *mut_program_data))
+	// Programs are immutable and device-owned. Helper renderers need their own state and buffers,
+	// but must not compile the same HLSL again on the first shadow or after a viewport change.
 	{
-		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::Resolve, VertShaderId::Passthrough,
-			shader_frag_resolve, sizeof(shader_frag_resolve));
-		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::ForegroundResolve, VertShaderId::Passthrough,
-			shader_frag_foreground_resolve, sizeof(shader_frag_foreground_resolve));
-		Gfx::CreateOptionalProgram(m_d3d_device, *mut_program_data, ProgramId::BlurPaired, VertShaderId::Blur,
-			shader_frag_blur_paired, sizeof(shader_frag_blur_paired));
-		program_data = std::move(mut_program_data);
-	}
-	else
-	{
-		Gfx::DestroyShaders(*mut_program_data);
-		return;
+		static std::mutex programs_mutex;
+		static Rml::WeakPtr<const Gfx::ProgramData> cached_programs;
+		static ID3D11Device* cached_device = nullptr;
+		std::lock_guard<std::mutex> lock(programs_mutex);
+		if (cached_device == m_d3d_device) program_data = cached_programs.lock();
+		if (!program_data)
+		{
+			Rml::SharedPtr<Gfx::ProgramData> programs(new Gfx::ProgramData(), [](Gfx::ProgramData* data)
+			{
+				Gfx::DestroyShaders(*data);
+				delete data;
+			});
+			if (!Gfx::CreateShaders(m_d3d_device, *programs)) return;
+			Gfx::CreateOptionalProgram(m_d3d_device, *programs, ProgramId::Resolve, VertShaderId::Passthrough,
+				shader_frag_resolve, sizeof(shader_frag_resolve));
+			Gfx::CreateOptionalProgram(m_d3d_device, *programs, ProgramId::ResolveRegion, VertShaderId::Passthrough, shader_frag_resolve_region,
+				sizeof(shader_frag_resolve_region));
+			Gfx::CreateOptionalProgram(m_d3d_device, *programs, ProgramId::ForegroundResolve, VertShaderId::Passthrough,
+				shader_frag_foreground_resolve, sizeof(shader_frag_foreground_resolve));
+			Gfx::CreateOptionalProgram(m_d3d_device, *programs, ProgramId::BlurPaired, VertShaderId::Blur,
+				shader_frag_blur_paired, sizeof(shader_frag_blur_paired));
+			program_data = std::move(programs);
+			cached_device = m_d3d_device;
+			cached_programs = program_data;
+		}
 	}
 
 	// Create vertex layout. This will be constant to avoid copying to an intermediate struct.
@@ -1153,6 +1209,9 @@ RenderInterface_DX11::RenderInterface_DX11(ID3D11Device* p_d3d_device)
 		{
 			return;
 		}
+		cbufferDesc.ByteWidth = sizeof(m_sampling_values);
+		if (FAILED(m_d3d_device->CreateBuffer(&cbufferDesc, nullptr, &m_sampling_cbuffer)))
+			return;
 	}
 
 	// Create sampler state for textures
@@ -1247,7 +1306,6 @@ RenderInterface_DX11::~RenderInterface_DX11()
 
 	if (program_data)
 	{
-		Gfx::DestroyShaders(*program_data);
 		program_data.reset();
 	}
 
@@ -1267,6 +1325,7 @@ RenderInterface_DX11::~RenderInterface_DX11()
 	Dx11CleanupResourceIfCreated(m_color_matrix_cbuffer);
 	Dx11CleanupResourceIfCreated(m_blur_cbuffer);
 	Dx11CleanupResourceIfCreated(m_drop_shadow_cbuffer);
+	Dx11CleanupResourceIfCreated(m_sampling_cbuffer);
 	Dx11CleanupResourceIfCreated(m_vertex_layout);
 	Dx11CleanupResourceIfCreated(m_d3d_context);
 	Dx11CleanupResourceIfCreated(m_d3d_device_1);
@@ -1301,6 +1360,8 @@ void RenderInterface_DX11::BeginFrame(bool preserve_state, const FrameRegions* r
 		m_d3d_context->VSGetShader(&m_previous_d3d_state.vertex_shader, m_previous_d3d_state.vertex_shader_instances,
 			&m_previous_d3d_state.vertex_shader_instances_count);
 		m_d3d_context->VSGetConstantBuffers(0, 1, &m_previous_d3d_state.vertex_shader_constant_buffer);
+		m_d3d_context->VSGetConstantBuffers(2, 1, &m_previous_d3d_state.vertex_sampling_buffer);
+		m_d3d_context->PSGetConstantBuffers(2, 1, &m_previous_d3d_state.pixel_sampling_buffer);
 		m_d3d_context->GSGetShader(&m_previous_d3d_state.geometry_shader, m_previous_d3d_state.geometry_shader_instances,
 			&m_previous_d3d_state.geometry_shader_instances_count);
 
@@ -1329,8 +1390,13 @@ void RenderInterface_DX11::BeginFrame(bool preserve_state, const FrameRegions* r
 
 	SetTransform(nullptr);
 
-	m_render_layers->BeginFrame(m_viewport_width, m_viewport_height);
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
+	m_clip_commands.clear();
+	++m_clip_generation;
+	m_is_stencil_enabled = false;
+	m_scissor_state = Rml::Rectanglei::MakeInvalid();
+	m_scissor_binding_dirty = true;
+	m_render_layers->BeginFrame(m_canvas_width, m_canvas_height);
+	BindTarget(m_render_layers->GetTopLayer());
 	float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 	if (!m_frame_regions || !m_frame_regions->opaque_background)
 	{
@@ -1350,22 +1416,23 @@ void RenderInterface_DX11::BeginFrame(bool preserve_state, const FrameRegions* r
 
 void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view)
 {
+	m_render_layers->SelectPostprocess(0);
 	RMLUI_ASSERTMSG(p_render_target_view, "p_render_target_view cannot be nullptr!");
 	if (m_frame_regions && !m_frame_regions->full)
 	{
 		if (m_frame_regions->output.empty()) { FinishFrame(); return; }
 		const auto& source = m_render_layers->GetTopLayer();
-		const auto& destination = m_render_layers->GetPostprocessPrimary();
+		const auto& destination = m_render_layers->GetResolveTarget(m_render_layers->GetTopLayer());
 		ID3D11ShaderResourceView* null_views[2] = {};
 		// Resolve each non-overlapping output rectangle once; stale pixels outside it are never sampled.
 		m_d3d_context->PSSetShaderResources(0, 2, null_views);
-		Gfx::BindRenderTarget(m_d3d_context, destination);
+		BindTarget(destination);
 		DisableBlend();
 		UseProgram(ProgramId::Resolve);
 		// RenderGeometry unbinds t0 after each draw, including fullscreen quads.
 		for (const auto& region : m_frame_regions->output)
 		{
-			Gfx::BindTexture(m_d3d_context, source);
+			BindTexture(source);
 			SetScissor(region);
 			DrawFullscreenQuad();
 		}
@@ -1376,7 +1443,7 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 		UseProgram(ProgramId::Passthrough);
 		for (const auto& region : m_frame_regions->output)
 		{
-			Gfx::BindTexture(m_d3d_context, destination);
+			BindTexture(destination);
 			SetScissor(region);
 			DrawFullscreenQuad();
 		}
@@ -1385,7 +1452,7 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 	}
 
 	const Gfx::RenderTargetData& rt_active = m_render_layers->GetTopLayer();
-	const Gfx::RenderTargetData& rt_postprocess = m_render_layers->GetPostprocessPrimary();
+	const Gfx::RenderTargetData& rt_postprocess = m_render_layers->GetResolveTarget(m_render_layers->GetTopLayer());
 
 	// Resolve MSAA to the post-process framebuffer.
 	m_d3d_context->ResolveSubresource(rt_postprocess.render_target_texture, 0, rt_active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1395,7 +1462,7 @@ void RenderInterface_DX11::EndFrame(ID3D11RenderTargetView* p_render_target_view
 
 	// Assuming we have an opaque background, we can just write to it with the premultiplied alpha blend mode and we'll get the correct result.
 	// Instead, if we had a transparent destination that didn't use premultiplied alpha, we would need to perform a manual un-premultiplication step.
-	Gfx::BindTexture(m_d3d_context, rt_postprocess);
+	BindTexture(rt_postprocess);
 	m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
 	UseProgram(ProgramId::Passthrough);
@@ -1409,6 +1476,7 @@ void RenderInterface_DX11::FinishFrame()
 {
 	m_frame_regions = nullptr;
 	m_render_layers->EndFrame();
+	m_clip_commands.clear();
 
 	// Reset internal state
 	m_current_blend_state = nullptr;
@@ -1463,6 +1531,10 @@ void RenderInterface_DX11::FinishFrame()
 			m_previous_d3d_state.vertex_shader->Release();
 		}
 		m_d3d_context->VSSetConstantBuffers(0, 1, &m_previous_d3d_state.vertex_shader_constant_buffer);
+		m_d3d_context->VSSetConstantBuffers(2, 1, &m_previous_d3d_state.vertex_sampling_buffer);
+		m_d3d_context->PSSetConstantBuffers(2, 1, &m_previous_d3d_state.pixel_sampling_buffer);
+		Dx11CleanupResourceIfCreated(m_previous_d3d_state.vertex_sampling_buffer);
+		Dx11CleanupResourceIfCreated(m_previous_d3d_state.pixel_sampling_buffer);
 		if (m_previous_d3d_state.vertex_shader_constant_buffer)
 		{
 			m_previous_d3d_state.vertex_shader_constant_buffer->Release();
@@ -1575,6 +1647,8 @@ void RenderInterface_DX11::ReleaseGeometry(Rml::CompiledGeometryHandle handle)
 void RenderInterface_DX11::RenderGeometry(Rml::CompiledGeometryHandle handle, Rml::Vector2f translation, Rml::TextureHandle texture)
 {
 	DX11_GeometryData* geometry = (DX11_GeometryData*)handle;
+	if (!m_drawing_clip && texture != TexturePostprocess && texture != TexturePostprocessNoBinding)
+		EnsureClip(m_render_layers->GetTopLayer());
 
 	if (m_translation != translation)
 	{
@@ -1862,43 +1936,53 @@ static Rml::Rectanglei VerticallyFlipped(Rml::Rectanglei rect, int viewport_heig
 	return flipped_rect;
 }
 
+Rml::Rectanglei RenderInterface_DX11::LocalBounds(Rml::Rectanglei bounds) const
+{
+	if (bounds.Valid())
+	{
+		bounds.p0 -= m_target_origin;
+		bounds.p1 -= m_target_origin;
+	}
+	return bounds;
+}
+
+void RenderInterface_DX11::SetLocalScissor(Rml::Rectanglei region, bool vertically_flip)
+{
+	if (region.Valid())
+	{
+		region.p0 += m_target_origin;
+		region.p1 += m_target_origin;
+	}
+	SetScissor(region, vertically_flip);
+}
+
 void RenderInterface_DX11::SetScissor(Rml::Rectanglei region, bool vertically_flip)
 {
-	if (region.Valid() != m_scissor_state.Valid())
-	{
-		if (region.Valid())
-		{
-			m_d3d_context->RSSetState(m_rasterizer_state_scissor_enabled);
-			m_scissor_enabled = true;
-		}
-		else
-		{
-			m_d3d_context->RSSetState(m_rasterizer_state_scissor_disabled);
-			m_scissor_enabled = false;
-		}
-	}
-
 	if (region.Valid() && vertically_flip)
-		region = VerticallyFlipped(region, m_viewport_height);
-
-	if (region.Valid() && region != m_scissor_state)
 	{
-		// Some render APIs don't like offscreen positions (WebGL in particular), so clamp them to the viewport.
-		const int x_min = Rml::Math::Clamp(region.Left(), 0, m_viewport_width);
-		const int y_min = Rml::Math::Clamp(region.Top(), 0, m_viewport_height);
-		const int x_max = Rml::Math::Clamp(region.Right(), 0, m_viewport_width);
-		const int y_max = Rml::Math::Clamp(region.Bottom(), 0, m_viewport_height);
-
-		D3D11_RECT rect_scissor = {};
-		rect_scissor.left = x_min;
-		rect_scissor.top = y_min;
-		rect_scissor.right = x_max;
-		rect_scissor.bottom = y_max;
-
-		m_d3d_context->RSSetScissorRects(1, &rect_scissor);
+		auto local = VerticallyFlipped(LocalBounds(region), m_viewport_height);
+		region = Rml::Rectanglei::FromPositionSize(local.p0 + m_target_origin, local.Size());
 	}
-
+	const bool canvas_clip = m_target_is_layer &&
+		(m_target_origin.x < 0 || m_target_origin.y < 0 || m_target_origin.x + m_viewport_width > m_canvas_width ||
+			m_target_origin.y + m_viewport_height > m_canvas_height);
+	const bool enabled = region.Valid() || canvas_clip;
+	if (enabled != m_scissor_enabled || m_scissor_binding_dirty)
+	{
+		m_d3d_context->RSSetState(enabled ? m_rasterizer_state_scissor_enabled : m_rasterizer_state_scissor_disabled);
+		m_scissor_enabled = enabled;
+	}
+	if (enabled && (region != m_scissor_state || m_scissor_binding_dirty))
+	{
+		const auto canvas = Rml::Rectanglei::FromSize({m_canvas_width, m_canvas_height});
+		const auto clipped = canvas_clip ? (region.Valid() ? region.Intersect(canvas) : canvas) : region;
+		const auto local = LocalBounds(clipped);
+		D3D11_RECT scissor{Rml::Math::Clamp(local.Left(), 0, m_viewport_width), Rml::Math::Clamp(local.Top(), 0, m_viewport_height),
+			Rml::Math::Clamp(local.Right(), 0, m_viewport_width), Rml::Math::Clamp(local.Bottom(), 0, m_viewport_height)};
+		m_d3d_context->RSSetScissorRects(1, &scissor);
+	}
 	m_scissor_state = region;
+	m_scissor_binding_dirty = false;
 }
 
 void RenderInterface_DX11::EnableScissorRegion(bool enable)
@@ -1915,8 +1999,14 @@ void RenderInterface_DX11::SetScissorRegion(Rml::Rectanglei region)
 
 void RenderInterface_DX11::SetViewport(const int width, const int height)
 {
-	m_viewport_width = width;
-	m_viewport_height = height;
+	if (!m_surface_target && (m_canvas_width != width || m_canvas_height != height))
+	{
+		m_default_render_layers.Reset();
+		m_mask_pool.clear();
+	}
+	m_canvas_width = m_viewport_width = width;
+	m_canvas_height = m_viewport_height = height;
+	m_target_origin = {};
 	m_raster_scale = {1, 1};
 	m_projection = Rml::Matrix4f::ProjectOrtho(0, (float)width, (float)height, 0, -10000, 10000);
 }
@@ -1974,8 +2064,76 @@ void RenderInterface_DX11::DisableBlend()
 
 void RenderInterface_DX11::SetTransform(const Rml::Matrix4f* new_transform)
 {
-	m_transform = (new_transform ? (m_projection * (*new_transform)) : m_projection);
+	m_user_transform = new_transform ? *new_transform : Rml::Matrix4f::Identity();
+	m_transform = m_projection * m_user_transform;
 	m_cbuffer_dirty = true;
+}
+
+void RenderInterface_DX11::SetTargetSpace(int width, int height, Rml::Vector2i origin, bool is_layer)
+{
+	m_target_is_layer = is_layer;
+	m_viewport_width = width;
+	m_viewport_height = height;
+	m_target_origin = origin;
+	D3D11_VIEWPORT viewport{};
+	viewport.Width = float(width);
+	viewport.Height = float(height);
+	viewport.MaxDepth = 1;
+	m_d3d_context->RSSetViewports(1, &viewport);
+	m_projection = Rml::Matrix4f::ProjectOrtho(origin.x / m_raster_scale.x, (origin.x + width) / m_raster_scale.x,
+		(origin.y + height) / m_raster_scale.y, origin.y / m_raster_scale.y, -10000, 10000);
+	m_transform = m_projection * m_user_transform;
+	m_cbuffer_dirty = true;
+	m_scissor_binding_dirty = true;
+	SetScissor(m_scissor_state);
+}
+
+void RenderInterface_DX11::BindTarget(const Gfx::RenderTargetData& target, bool update_space)
+{
+	Gfx::BindRenderTarget(m_d3d_context, target);
+	if (update_space)
+		SetTargetSpace(Rml::Math::Max(1, target.bounds.Width()), Rml::Math::Max(1, target.bounds.Height()), target.bounds.p0,
+			target.depth_stencil_view != nullptr);
+}
+
+void RenderInterface_DX11::BindTexture(const Gfx::RenderTargetData& texture, uint32_t slot, bool logical_uv)
+{
+	Gfx::BindTexture(m_d3d_context, texture, slot);
+	if (slot)
+		return;
+	const float width = float(Rml::Math::Max(1, texture.bounds.Width())), height = float(Rml::Math::Max(1, texture.bounds.Height()));
+	const float values[8] = {logical_uv ? width / texture.width : 1.f, logical_uv ? height / texture.height : 1.f, 0, 0, .5f / texture.width,
+		.5f / texture.height, (width - .5f) / texture.width, (height - .5f) / texture.height};
+	if (!m_sampling_initialized || memcmp(values, m_sampling_values, sizeof(values)))
+	{
+		D3D11_MAPPED_SUBRESOURCE mapping{};
+		if (SUCCEEDED(m_d3d_context->Map(m_sampling_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping)))
+		{
+			memcpy(mapping.pData, values, sizeof(values));
+			m_d3d_context->Unmap(m_sampling_cbuffer, 0);
+			memcpy(m_sampling_values, values, sizeof(values));
+			m_sampling_initialized = true;
+		}
+	}
+	m_d3d_context->VSSetConstantBuffers(2, 1, &m_sampling_cbuffer);
+	m_d3d_context->PSSetConstantBuffers(2, 1, &m_sampling_cbuffer);
+}
+
+void RenderInterface_DX11::DrawTargetQuad(const Gfx::RenderTargetData& source, const Gfx::RenderTargetData& destination)
+{
+	if (source.bounds.Width() == destination.bounds.Width() && source.bounds.Height() == destination.bounds.Height() &&
+		source.bounds.p0 == destination.bounds.p0)
+	{
+		DrawFullscreenQuad();
+		return;
+	}
+	const auto offset = source.bounds.p0 - destination.bounds.p0;
+	const float x0 = 2.f * offset.x / destination.bounds.Width() - 1.f,
+				x1 = 2.f * (offset.x + source.bounds.Width()) / destination.bounds.Width() - 1.f;
+	const float y1 = 1.f - 2.f * offset.y / destination.bounds.Height(),
+				y0 = 1.f - 2.f * (offset.y + source.bounds.Height()) / destination.bounds.Height();
+	const Rml::Vertex vertices[4] = {{{x0, y0}, {}, {0, 0}}, {{x1, y0}, {}, {1, 0}}, {{x1, y1}, {}, {1, 1}}, {{x0, y1}, {}, {0, 1}}};
+	DrawQuad({vertices, 4});
 }
 
 void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source, const Gfx::RenderTargetData& dest, int srcX0, int srcY0, int srcX1,
@@ -2010,6 +2168,9 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 		return;
 	}
 
+	const auto original_origin = m_target_origin;
+	const bool original_is_layer = m_target_is_layer;
+	const int original_width = m_viewport_width, original_height = m_viewport_height;
 	ID3D11RenderTargetView* original_target = nullptr;
 	ID3D11DepthStencilView* original_depth = nullptr;
 	m_d3d_context->OMGetRenderTargets(1, &original_target, &original_depth);
@@ -2021,7 +2182,7 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	const Gfx::RenderTargetData* sampled = &source;
 	if (source.sample_count > 1 || source.render_target_texture == dest.render_target_texture)
 	{
-		const auto* scratch = &m_render_layers->GetTemporary();
+		const auto* scratch = &m_render_layers->GetResolveTarget(source);
 		auto aliases = [&](const Gfx::RenderTargetData* candidate)
 		{
 			return candidate->render_target_texture == source.render_target_texture || candidate->render_target_texture == dest.render_target_texture;
@@ -2035,24 +2196,25 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	}
 
 	// Rebinding the output releases source from its RTV slot before it becomes an SRV.
-	Gfx::BindRenderTarget(m_d3d_context, dest);
+	BindTarget(dest);
 	D3D11_VIEWPORT viewport{};
-	viewport.Width = float(dest.width);
-	viewport.Height = float(dest.height);
+	viewport.Width = float(dest.bounds.Width());
+	viewport.Height = float(dest.bounds.Height());
 	viewport.MaxDepth = 1.f;
 	m_d3d_context->RSSetViewports(1, &viewport);
 	m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
-	Gfx::BindTexture(m_d3d_context, *sampled);
+	BindTexture(*sampled, 0, false);
 	UseProgram(ProgramId::Passthrough);
 
 	const float u0 = float(srcX0) / float(source.width);
-	const float v0 = float(srcY1) / float(source.height);
+	const int padding_y = source.height - source.bounds.Height();
+	const float v0 = float(padding_y + srcY1) / source.height;
 	const float u1 = float(srcX1) / float(source.width);
-	const float v1 = float(srcY0) / float(source.height);
-	const float x0 = (dstX0 / float(dest.width)) * 2.f - 1.f;
-	const float y0 = ((dest.height - dstY0 - dest_height) / float(dest.height)) * 2.f - 1.f;
-	const float x1 = ((dstX0 + dest_width) / float(dest.width)) * 2.f - 1.f;
-	const float y1 = ((dest.height - dstY0) / float(dest.height)) * 2.f - 1.f;
+	const float v1 = float(padding_y + srcY0) / source.height;
+	const float x0 = (dstX0 / float(dest.bounds.Width())) * 2.f - 1.f;
+	const float y0 = ((dest.bounds.Height() - dstY0 - dest_height) / float(dest.bounds.Height())) * 2.f - 1.f;
+	const float x1 = ((dstX0 + dest_width) / float(dest.bounds.Width())) * 2.f - 1.f;
+	const float y1 = ((dest.bounds.Height() - dstY0) / float(dest.bounds.Height())) * 2.f - 1.f;
 	const Rml::Vertex vertices[4] = {
 		{{x0, y0}, {}, {u0, v0}}, {{x1, y0}, {}, {u1, v0}},
 		{{x1, y1}, {}, {u1, v1}}, {{x0, y1}, {}, {u0, v1}}
@@ -2065,51 +2227,65 @@ void RenderInterface_DX11::BlitRenderTarget(const Gfx::RenderTargetData& source,
 	m_current_blend_state = original_blend;
 	if (original_blend_enabled) SetBlendState(original_blend);
 	else DisableBlend();
-	viewport.Width = float(m_viewport_width);
-	viewport.Height = float(m_viewport_height);
-	m_d3d_context->RSSetViewports(1, &viewport);
+	SetTargetSpace(original_width, original_height, original_origin, original_is_layer);
 	Dx11CleanupResourceIfCreated(original_target);
 	Dx11CleanupResourceIfCreated(original_depth);
 }
 
-void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional)
+void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional, bool preserve_space)
 {
+	if (!preserve_space)
+	{
+		m_render_layers->SelectPostprocess(layer_handle);
+		m_render_layers->SetPostprocessBounds(m_render_layers->GetLayer(layer_handle).bounds, 0);
+	}
 	const Gfx::RenderTargetData& source = m_render_layers->GetLayer(layer_handle);
 	const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessPrimary();
 
-	// Resolving a small input region avoids reading the whole MSAA layer. Retain full-size targets and pixel coordinates.
-	if (allow_regional && m_scissor_state.Valid()
-		&& source.sample_count == MsaaSamples && destination.sample_count == 1
-		&& source.width == destination.width && source.height == destination.height
-		&& source.width == m_viewport_width && source.height == m_viewport_height
-		&& source.render_target_shader_resource_view && program_data && program_data->programs[ProgramId::Resolve].pixel_shader)
+	// Resolve directly into a cropped target; avoid a full-size intermediate for a small filter.
+	if (allow_regional && source.sample_count == MsaaSamples && source.render_target_shader_resource_view && program_data &&
+		program_data->programs[ProgramId::ResolveRegion].pixel_shader)
 	{
-		const Rml::Rectanglei region = Rml::Rectanglei::FromCorners(
-			{Rml::Math::Clamp(m_scissor_state.Left(), 0, source.width), Rml::Math::Clamp(m_scissor_state.Top(), 0, source.height)},
-			{Rml::Math::Clamp(m_scissor_state.Right(), 0, source.width), Rml::Math::Clamp(m_scissor_state.Bottom(), 0, source.height)});
-		const uint64_t pixels = uint64_t(region.Width()) * uint64_t(region.Height());
+		auto region = source.bounds.Intersect(destination.bounds);
+		if (m_scissor_state.Valid())
+			region = region.Intersect(m_scissor_state);
+		const uint64_t pixels = uint64_t(Rml::Math::Max(0, region.Width())) * uint64_t(Rml::Math::Max(0, region.Height()));
 		const uint64_t full_pixels = uint64_t(source.width) * uint64_t(source.height);
-		if (pixels > 0 && pixels <= full_pixels / 4)
+		D3D11_MAPPED_SUBRESOURCE mapping{};
+		const bool cropped = source.width != destination.width || source.height != destination.height || source.bounds.p0 != destination.bounds.p0;
+		if (pixels && (cropped || pixels <= full_pixels / 4) &&
+			SUCCEEDED(m_d3d_context->Map(m_drop_shadow_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping)))
 		{
+			const auto offset = destination.bounds.p0 - source.bounds.p0;
+			const int values[4] = {offset.x, offset.y, 0, 0};
+			memcpy(mapping.pData, values, sizeof(values));
+			m_d3d_context->Unmap(m_drop_shadow_cbuffer, 0);
 			ID3D11RenderTargetView* original_target = nullptr;
 			ID3D11DepthStencilView* original_depth = nullptr;
 			m_d3d_context->OMGetRenderTargets(1, &original_target, &original_depth);
-			ID3D11BlendState* original_blend = m_current_blend_state;
-			const bool original_blend_enabled = m_current_blend_state_enabled;
-			const Rml::Rectanglei original_scissor = m_scissor_state;
-			ID3D11ShaderResourceView* null_views[2] = {nullptr, nullptr};
+			const int original_width = m_viewport_width, original_height = m_viewport_height;
+			const auto original_origin = m_target_origin;
+			const bool original_is_layer = m_target_is_layer;
+			const auto original_scissor = m_scissor_state;
+			const auto original_blend = m_current_blend_state;
+			const bool original_blending = m_current_blend_state_enabled;
+			ID3D11ShaderResourceView* null_views[2] = {};
 			m_d3d_context->PSSetShaderResources(0, 2, null_views);
-			// Binding the single-sample output first releases the MSAA source from its RTV/DSV slots.
-			Gfx::BindRenderTarget(m_d3d_context, destination);
-			Gfx::BindTexture(m_d3d_context, source);
+			const float clear[4] = {};
+			m_d3d_context->ClearRenderTargetView(destination.render_target_view, clear);
+			BindTarget(destination);
+			BindTexture(source);
 			DisableBlend();
 			SetScissor(region);
-			UseProgram(ProgramId::Resolve);
+			UseProgram(ProgramId::ResolveRegion);
+			m_d3d_context->PSSetConstantBuffers(1, 1, &m_drop_shadow_cbuffer);
 			DrawFullscreenQuad();
 			m_d3d_context->PSSetShaderResources(0, 2, null_views);
 			m_d3d_context->OMSetRenderTargets(1, &original_target, original_depth);
-			if (original_blend_enabled) SetBlendState(original_blend);
+			if (original_blending)
+				SetBlendState(original_blend);
 			else DisableBlend();
+			SetTargetSpace(original_width, original_height, original_origin, original_is_layer);
 			SetScissor(original_scissor);
 			Dx11CleanupResourceIfCreated(original_target);
 			Dx11CleanupResourceIfCreated(original_depth);
@@ -2117,25 +2293,88 @@ void RenderInterface_DX11::BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_
 		}
 	}
 
-	// Hardware ResolveSubresource resolves the entire subresource, independently of the active scissor.
-	BlitRenderTarget(source, destination, 0, 0, source.width, source.height, 0, 0, destination.width, destination.height);
+	// Retile the resolved source into the filter's pixel-aligned working rectangle.
+	ID3D11ShaderResourceView* null_views[2] = {};
+	m_d3d_context->PSSetShaderResources(0, 2, null_views);
+	const float clear[4] = {};
+	m_d3d_context->ClearRenderTargetView(destination.render_target_view, clear);
+	const auto offset = source.bounds.p0 - destination.bounds.p0;
+	if (source.width == destination.width && source.height == destination.height && offset == Rml::Vector2i{})
+	{
+		BlitRenderTarget(source, destination, 0, 0, source.width, source.height, 0, 0, destination.width, destination.height);
+		return;
+	}
+	const auto& resolved = m_render_layers->GetResolveTarget(source);
+	m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
+	m_d3d_context->ResolveSubresource(resolved.render_target_texture, 0, source.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+	const auto blend = m_current_blend_state;
+	const bool blending = m_current_blend_state_enabled;
+	BindTarget(destination);
+	DisableBlend();
+	BindTexture(resolved, 0, false);
+	m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
+	UseProgram(ProgramId::Passthrough);
+	const Rml::Vector2f scale{float(destination.bounds.Width()) / source.width, float(destination.bounds.Height()) / source.height};
+	DrawFullscreenQuad({float(-offset.x) / source.width, 1.f - scale.y + float(offset.y) / source.height}, scale);
+	m_d3d_context->PSSetShaderResources(0, 2, null_views);
+	if (blending)
+		SetBlendState(blend);
+	else
+		DisableBlend();
 }
+
+enum class FilterType { Invalid = 0, Passthrough, Blur, DropShadow, ColorMatrix, MaskImage };
+struct CompiledFilter {
+	FilterType type;
+
+	// Passthrough
+	float blend_factor;
+
+	// Blur
+	float sigma;
+
+	// Drop shadow
+	Rml::Vector2f offset;
+	Rml::ColourbPremultiplied color;
+
+	// ColorMatrix
+	Rml::Matrix4f color_matrix;
+	Rml::SharedPtr<Gfx::RenderTargetData> mask;
+	Rml::Rectanglei mask_bounds = Rml::Rectanglei::MakeInvalid();
+};
+
+static void SigmaToParameters(float desired_sigma, int& out_pass_level, float& out_sigma);
 
 Rml::LayerHandle RenderInterface_DX11::PushLayer()
 {
-	const Rml::LayerHandle layer_handle = m_render_layers->PushLayer();
+	return PushLayerWithBounds(Rml::Rectanglei::MakeInvalid());
+}
 
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
-	float colors[4] = {0, 0, 0, 0};
-	m_d3d_context->ClearRenderTargetView(m_render_layers->GetTopLayer().render_target_view, colors);
-
-	return layer_handle;
+Rml::LayerHandle RenderInterface_DX11::PushLayerWithBounds(Rml::Rectanglei bounds)
+{
+	if (bounds.Valid())
+		bounds = RasterBounds(bounds).Extend(2).Intersect(Rml::Rectanglei::FromSize({m_canvas_width, m_canvas_height}));
+	const auto layer = m_render_layers->PushLayer(bounds);
+	BindTarget(m_render_layers->GetTopLayer());
+	const float clear[4] = {};
+	m_d3d_context->ClearRenderTargetView(m_render_layers->GetTopLayer().render_target_view, clear);
+	return layer;
 }
 
 void RenderInterface_DX11::CompositeLayers(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle, Rml::BlendMode blend_mode,
 	Rml::Span<const Rml::CompiledFilterHandle> filters)
 {
 	CompositeLayersInternal(source_handle, destination_handle, blend_mode, filters, m_scissor_state);
+}
+
+void RenderInterface_DX11::BeginTextureGeneration()
+{
+	++m_texture_generation_depth;
+}
+void RenderInterface_DX11::EndTextureGeneration()
+{
+	RMLUI_ASSERT(m_texture_generation_depth);
+	--m_texture_generation_depth;
 }
 
 bool RenderInterface_DX11::SupportsCompositeLayersWithInputBounds() const
@@ -2160,19 +2399,51 @@ void RenderInterface_DX11::CompositeLayersInternal(Rml::LayerHandle source_handl
 	// Blit source layer to postprocessing buffer. Do this regardless of whether we actually have any filters to be
 	// applied, because we need to resolve the multi-sampled framebuffer in any case.
 	// @performance If we have BlendMode::Replace and no filters or mask then we can just blit directly to the destination.
-	BlitLayerToPostprocessPrimary(source_handle, true);
+	m_render_layers->SelectPostprocess(source_handle);
+	int alignment = 0;
+	for (auto handle : filters)
+	{
+		const auto& filter = *reinterpret_cast<const CompiledFilter*>(handle);
+		if (filter.type == FilterType::Blur || filter.type == FilterType::DropShadow)
+		{
+			int level = 0;
+			float sigma = 0;
+			SigmaToParameters(filter.sigma * Rml::Math::Max(m_raster_scale.x, m_raster_scale.y), level, sigma);
+			alignment = Rml::Math::Max(alignment, 1 << level);
+		}
+	}
+	// Callback generation already has a bounded viewport. Keep its established blur sampling grid.
+	if (m_texture_generation_depth)
+		alignment = 0;
+	if (alignment)
+		m_render_layers->SetPostprocessBounds(input_bounds, alignment);
+	else
+		m_render_layers->SetPostprocessBounds(m_render_layers->GetLayer(source_handle).bounds, 0);
+	BlitLayerToPostprocessPrimary(source_handle, true, true);
+	BindTarget(m_render_layers->GetPostprocessPrimary());
 	if (m_backdrop_active && source_handle == 0 && m_backdrop_texture)
 	{
 		const auto& source = m_render_layers->GetPostprocessPrimary();
 		const auto& destination = m_render_layers->GetPostprocessSecondary();
-		Gfx::BindRenderTarget(m_d3d_context, destination);
-		Gfx::BindTexture(m_d3d_context, source);
+		BindTarget(destination);
+		BindTexture(source);
 		m_d3d_context->PSSetShaderResources(1, 1, &m_backdrop_texture);
 		m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 		const auto blend = m_current_blend_state;
 		const bool blending = m_current_blend_state_enabled;
 		DisableBlend();
 		UseProgram(ProgramId::SurfaceBackdrop);
+		D3D11_MAPPED_SUBRESOURCE mapping{};
+		if (FAILED(m_d3d_context->Map(m_drop_shadow_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping)))
+		{
+			BindTarget(m_render_layers->GetTopLayer());
+			SetScissor(output_bounds);
+			return;
+		}
+		const float values[8] = {float(m_target_origin.x), float(m_target_origin.y), 1.f / m_canvas_width, 1.f / m_canvas_height};
+		memcpy(mapping.pData, values, sizeof(values));
+		m_d3d_context->Unmap(m_drop_shadow_cbuffer, 0);
+		m_d3d_context->PSSetConstantBuffers(1, 1, &m_drop_shadow_cbuffer);
 		DrawFullscreenQuad();
 		ID3D11ShaderResourceView* nullView = nullptr;
 		m_d3d_context->PSSetShaderResources(1, 1, &nullView);
@@ -2185,27 +2456,29 @@ void RenderInterface_DX11::CompositeLayersInternal(Rml::LayerHandle source_handl
 	SetScissor(output_bounds);
 
 	// Render to the destination layer.
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetLayer(destination_handle));
-	Gfx::BindTexture(m_d3d_context, m_render_layers->GetPostprocessPrimary());
+	const auto& destination = m_render_layers->GetLayer(destination_handle);
+	BindTarget(destination);
+	EnsureClip(destination);
+	BindTexture(m_render_layers->GetPostprocessPrimary());
 
 	UseProgram(ProgramId::Passthrough);
 
 	if (blend_mode == BlendMode::Replace)
 		DisableBlend();
 
-	DrawFullscreenQuad();
+	DrawTargetQuad(m_render_layers->GetPostprocessPrimary(), destination);
 
 	if (blend_mode == BlendMode::Replace)
 		SetBlendState(m_current_blend_state);
 
 	if (destination_handle != m_render_layers->GetTopLayerHandle())
-		Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
+		BindTarget(m_render_layers->GetTopLayer());
 }
 
 void RenderInterface_DX11::PopLayer()
 {
 	m_render_layers->PopLayer();
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
+	BindTarget(m_render_layers->GetTopLayer());
 }
 
 Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
@@ -2227,10 +2500,11 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 	const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
 
 	// Flip the image vertically, as that convention is used for textures, and move to origin.
-	BlitRenderTarget(source, destination, bounds.Left(), source.height - bounds.Bottom(), // src0
-		bounds.Right(), source.height - bounds.Top(),                                     // src1
-		0, bounds.Height(),                                                               // dst0
-		bounds.Width(), 0                                                                 // dst1
+	BlitRenderTarget(source, destination, bounds.Left() - source.bounds.Left(),
+		source.bounds.Height() - (bounds.Bottom() - source.bounds.Top()),                                     // src0
+		bounds.Right() - source.bounds.Left(), source.bounds.Height() - (bounds.Top() - source.bounds.Top()), // src1
+		0, bounds.Height(),                                                                                   // dst0
+		bounds.Width(), 0                                                                                     // dst1
 	);
 
 	// Now we need to copy the destination texture to the final texture for rendering
@@ -2257,57 +2531,48 @@ Rml::TextureHandle RenderInterface_DX11::SaveLayerAsTexture()
 
 	// Restore state and free memory
 	SetScissor(bounds);
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
+	BindTarget(m_render_layers->GetTopLayer());
 	texture_resource->Release();
 
 	return render_texture;
 }
 
-enum class FilterType { Invalid = 0, Passthrough, Blur, DropShadow, ColorMatrix, MaskImage };
-struct CompiledFilter {
-	FilterType type;
-
-	// Passthrough
-	float blend_factor;
-
-	// Blur
-	float sigma;
-
-	// Drop shadow
-	Rml::Vector2f offset;
-	Rml::ColourbPremultiplied color;
-
-	// ColorMatrix
-	Rml::Matrix4f color_matrix;
-};
-
 Rml::CompiledFilterHandle RenderInterface_DX11::SaveLayerAsMaskImage()
 {
 	BlitLayerToPostprocessPrimary(m_render_layers->GetTopLayerHandle());
-
-	const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
-	const Gfx::RenderTargetData& destination = m_render_layers->GetBlendMask();
-
-	// Unbind resources
-	ID3D11ShaderResourceView* const nullSRV = nullptr;
-	m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
-
-	Gfx::BindRenderTarget(m_d3d_context, destination);
-	Gfx::BindTexture(m_d3d_context, source);
-	UseProgram(ProgramId::Passthrough);
-	ID3D11BlendState* blend_state_backup = m_current_blend_state;
-	DisableBlend();
-
-	DrawFullscreenQuad();
-
-	// Unbind resources
-	m_d3d_context->PSSetShaderResources(0, 1, &nullSRV);
-
-	SetBlendState(blend_state_backup);
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
-
+	const auto& source = m_render_layers->GetPostprocessPrimary();
+	Rml::SharedPtr<Gfx::RenderTargetData> image;
+	for (auto& slot : m_mask_pool)
+		if (slot.use_count() == 1)
+		{
+			image = slot;
+			break;
+		}
+	if (!image)
+	{
+		image = Rml::SharedPtr<Gfx::RenderTargetData>(new Gfx::RenderTargetData, [](Gfx::RenderTargetData* value) {
+			Gfx::DestroyRenderTarget(*value);
+			delete value;
+		});
+		m_mask_pool.push_back(image);
+	}
+	if (image->width < source.bounds.Width() || image->height < source.bounds.Height())
+	{
+		const int width = Rml::Math::Max(image->width, source.bounds.Width()), height = Rml::Math::Max(image->height, source.bounds.Height());
+		Gfx::DestroyRenderTarget(*image);
+		if (!Gfx::CreateRenderTarget(m_d3d_device, *image, width, height, 0, Gfx::RenderTargetAttachment::None, nullptr))
+			return {};
+	}
+	ID3D11ShaderResourceView* null_views[2] = {};
+	m_d3d_context->PSSetShaderResources(0, 2, null_views);
+	m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
+	D3D11_BOX box{0, 0, 0, UINT(source.bounds.Width()), UINT(source.bounds.Height()), 1};
+	m_d3d_context->CopySubresourceRegion(image->render_target_texture, 0, 0, 0, 0, source.render_target_texture, 0, &box);
+	BindTarget(m_render_layers->GetTopLayer());
 	CompiledFilter filter = {};
 	filter.type = FilterType::MaskImage;
+	filter.mask = std::move(image);
+	filter.mask_bounds = source.bounds;
 	return reinterpret_cast<Rml::CompiledFilterHandle>(new CompiledFilter(std::move(filter)));
 }
 
@@ -2512,6 +2777,7 @@ Rml::CompiledShaderHandle RenderInterface_DX11::CompileShader(const Rml::String&
 void RenderInterface_DX11::RenderShader(Rml::CompiledShaderHandle shader_handle, Rml::CompiledGeometryHandle geometry_handle,
 	Rml::Vector2f translation, Rml::TextureHandle /*texture*/)
 {
+	EnsureClip(m_render_layers->GetTopLayer());
 	RMLUI_ASSERT(shader_handle && geometry_handle);
 	const CompiledShader& shader = *reinterpret_cast<CompiledShader*>(shader_handle);
 	const CompiledShaderType type = shader.type;
@@ -2632,7 +2898,7 @@ static void SigmaToParameters(const float desired_sigma, int& out_pass_level, fl
 }
 
 static void SetTexCoordLimits(Rml::Vector2f& p_tex_coord_min, Rml::Vector2f& p_tex_coord_max, Rml::Rectanglei rectangle_flipped,
-	Rml::Vector2i framebuffer_size)
+	Rml::Vector2i framebuffer_size, int logical_height = 0)
 {
 	// Offset by half-texel values so that texture lookups are clamped to fragment centers, thereby avoiding color
 	// bleeding from neighboring texels due to bilinear interpolation.
@@ -2640,9 +2906,9 @@ static void SetTexCoordLimits(Rml::Vector2f& p_tex_coord_min, Rml::Vector2f& p_t
 	const Rml::Vector2f max = (Rml::Vector2f(rectangle_flipped.p1) - Rml::Vector2f(0.5f)) / Rml::Vector2f(framebuffer_size);
 
 	p_tex_coord_min.x = min.x;
-	p_tex_coord_min.y = min.y;
+	p_tex_coord_min.y = min.y + (logical_height ? 1.f - float(logical_height) / framebuffer_size.y : 0.f);
 	p_tex_coord_max.x = max.x;
-	p_tex_coord_max.y = max.y;
+	p_tex_coord_max.y = max.y + (logical_height ? 1.f - float(logical_height) / framebuffer_size.y : 0.f);
 }
 
 static void SetBlurWeights(Rml::Vector4f& p_weights, float sigma)
@@ -2673,6 +2939,7 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 {
 	RMLUI_ASSERT(&source_destination != &temp && source_destination.width == temp.width && source_destination.height == temp.height);
 	RMLUI_ASSERT(window_flipped.Valid());
+	const int width = source_destination.bounds.Width(), height = source_destination.bounds.Height();
 
 	if (window_flipped.Top() == window_flipped.Bottom() || window_flipped.Left() == window_flipped.Right())
 	{
@@ -2705,40 +2972,39 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 	Rml::Rectanglei scissor = window_flipped;
 
 	UseProgram(ProgramId::Passthrough);
-	SetScissor(scissor, true);
+	SetLocalScissor(scissor, true);
 
 	// Downscale by iterative half-scaling with bilinear filtering, to reduce aliasing.
 	D3D11_VIEWPORT d3dviewport{};
 	d3dviewport.TopLeftX = 0;
 	// Align the reduced viewport to the bottom edge, including the extra row of an odd-height target.
-	d3dviewport.TopLeftY = static_cast<FLOAT>(source_destination.height - source_destination.height / 2);
-	d3dviewport.Width = static_cast<FLOAT>(source_destination.width / 2);
-	d3dviewport.Height = static_cast<FLOAT>(source_destination.height / 2);
+	d3dviewport.TopLeftY = static_cast<FLOAT>(height - height / 2);
+	d3dviewport.Width = static_cast<FLOAT>(width / 2);
+	d3dviewport.Height = static_cast<FLOAT>(height / 2);
 	d3dviewport.MinDepth = 0.0f;
 	d3dviewport.MaxDepth = 1.0f;
 	m_d3d_context->RSSetViewports(1, &d3dviewport);
 
 	// Scale UVs if we have even dimensions, such that texture fetches align perfectly between texels, thereby producing a 50% blend of
 	// neighboring texels.
-	const Rml::Vector2f uv_scaling = {(source_destination.width % 2 == 1) ? (1.f - 1.f / float(source_destination.width)) : 1.f,
-		(source_destination.height % 2 == 1) ? (1.f - 1.f / float(source_destination.height)) : 1.f};
+	const Rml::Vector2f uv_scaling = {(width % 2 == 1) ? (1.f - 1.f / float(width)) : 1.f, (height % 2 == 1) ? (1.f - 1.f / float(height)) : 1.f};
 
 	for (int i = 0; i < pass_level; i++)
 	{
 		scissor.p0 = (scissor.p0 + Rml::Vector2i(1)) / 2;
 		scissor.p1 = Rml::Math::Max(scissor.p1 / 2, scissor.p0);
 		const bool from_source = (i % 2 == 0);
-		Gfx::BindRenderTarget(m_d3d_context, (from_source ? temp : source_destination));
-		Gfx::BindTexture(m_d3d_context, from_source ? source_destination : temp);
-		SetScissor(scissor, true);
+		BindTarget((from_source ? temp : source_destination), false);
+		BindTexture(from_source ? source_destination : temp);
+		SetLocalScissor(scissor, true);
 
 		DrawFullscreenQuad({}, uv_scaling);
 	}
 
 	d3dviewport.TopLeftX = 0;
 	d3dviewport.TopLeftY = 0;
-	d3dviewport.Width = static_cast<FLOAT>(source_destination.width);
-	d3dviewport.Height = static_cast<FLOAT>(source_destination.height);
+	d3dviewport.Width = static_cast<FLOAT>(width);
+	d3dviewport.Height = static_cast<FLOAT>(height);
 	d3dviewport.MinDepth = 0.0f;
 	d3dviewport.MaxDepth = 1.0f;
 	m_d3d_context->RSSetViewports(1, &d3dviewport);
@@ -2747,8 +3013,8 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 	const bool transfer_to_temp_buffer = (pass_level % 2 == 0);
 	if (transfer_to_temp_buffer)
 	{
-		Gfx::BindRenderTarget(m_d3d_context, temp);
-		Gfx::BindTexture(m_d3d_context, source_destination);
+		BindTarget(temp, false);
+		BindTexture(source_destination);
 		DrawFullscreenQuad();
 	}
 
@@ -2778,7 +3044,7 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 		}
 	};
 	set_weights(dataPtr->blur, sigma.y);
-	SetTexCoordLimits(dataPtr->blur.texcoord_min, dataPtr->blur.texcoord_max, scissor, {source_destination.width, source_destination.height});
+	SetTexCoordLimits(dataPtr->blur.texcoord_min, dataPtr->blur.texcoord_max, scissor, {source_destination.width, source_destination.height}, height);
 
 	Rml::Vector2f texel_offset = Rml::Vector2f(0.f, 1.f) * (1.0f / float(temp.height));
 	dataPtr->blur.texel_offset = texel_offset;
@@ -2791,20 +3057,20 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 	m_d3d_context->VSSetConstantBuffers(1, 1, &null_buffer);
 
 	// Blur render pass - vertical.
-	Gfx::BindRenderTarget(m_d3d_context, source_destination);
-	Gfx::BindTexture(m_d3d_context, temp);
+	BindTarget(source_destination, false);
+	BindTexture(temp);
 	DrawFullscreenQuad();
 
 	// Blur render pass - horizontal.
-	Gfx::BindRenderTarget(m_d3d_context, temp);
-	Gfx::BindTexture(m_d3d_context, source_destination);
+	BindTarget(temp, false);
+	BindTexture(source_destination);
 
 	// Add a 1px transparent border around the blur region by first clearing with a padded scissor. This helps prevent
 	// artifacts when upscaling the blur result in the later step. On Intel and AMD, we have observed that during
 	// blitting with linear filtering, pixels outside the 'src' region can be blended into the output. On the other
 	// hand, it looks like Nvidia clamps the pixels to the source edge, which is what we really want. Regardless, we
 	// work around the issue with this extra step.
-	SetScissor(scissor.Extend(1), true);
+	SetLocalScissor(scissor.Extend(1), true);
 	// D3D11 does not support clearing based on scissor rects. So we use a D3D11Context1 to use ClearView, and define the D3D11_RECt here
 	Rml::Rectanglei scissor_ext = scissor.Extend(1);
 	scissor_ext = VerticallyFlipped(scissor_ext, m_viewport_height);
@@ -2823,7 +3089,7 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 
 	FLOAT clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 	m_d3d_context->ClearView(temp.render_target_view, clear_color, &rect_scissor, 1);
-	SetScissor(scissor, true);
+	SetLocalScissor(scissor, true);
 
 	// Update texel offset for upscale pass
 	result = m_d3d_context->Map(m_blur_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
@@ -2849,7 +3115,7 @@ void RenderInterface_DX11::RenderBlur(Rml::Vector2f sigma, const Gfx::RenderTarg
 
 	// Blit the blurred image to the scissor region with upscaling.
 	Rml::Rectanglei window_flipped_twice = VerticallyFlipped(window_flipped, m_viewport_height);
-	SetScissor(window_flipped_twice, false);
+	SetLocalScissor(window_flipped_twice, false);
 
 	const Rml::Vector2i src_min = scissor.p0;
 	const Rml::Vector2i src_max = scissor.p1;
@@ -2903,8 +3169,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
 			const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
-			Gfx::BindRenderTarget(m_d3d_context, destination);
-			Gfx::BindTexture(m_d3d_context, source);
+			BindTarget(destination);
+			BindTexture(source);
 			m_d3d_context->PSSetSamplers(0, 1, &m_postprocess_sampler_state);
 
 			DrawFullscreenQuad();
@@ -2922,7 +3188,7 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			const Gfx::RenderTargetData& source_destination = m_render_layers->GetPostprocessPrimary();
 			const Gfx::RenderTargetData& temp = m_render_layers->GetPostprocessSecondary();
 
-			const Rml::Rectanglei window_flipped = VerticallyFlipped(m_scissor_state, m_viewport_height);
+			const Rml::Rectanglei window_flipped = VerticallyFlipped(LocalBounds(m_scissor_state), m_viewport_height);
 			RenderBlur(m_raster_scale * filter.sigma, source_destination, temp, window_flipped);
 
 			SetBlendState(blend_state_backup);
@@ -2936,8 +3202,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			const Gfx::RenderTargetData& primary = m_render_layers->GetPostprocessPrimary();
 			const Gfx::RenderTargetData& secondary = m_render_layers->GetPostprocessSecondary();
-			Gfx::BindRenderTarget(m_d3d_context, secondary);
-			Gfx::BindTexture(m_d3d_context, primary);
+			BindTarget(secondary);
+			BindTexture(primary);
 
 			D3D11_MAPPED_SUBRESOURCE mappedResource{};
 			// Lock the constant buffer so it can be written to.
@@ -2958,8 +3224,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			dataPtr->color.z = color.blue;
 			dataPtr->color.w = color.alpha;
 
-			const Rml::Rectanglei window_flipped = VerticallyFlipped(m_scissor_state, m_viewport_height);
-			SetTexCoordLimits(dataPtr->texcoord_min, dataPtr->texcoord_max, m_scissor_state, {primary.width, primary.height});
+			const Rml::Rectanglei window_flipped = VerticallyFlipped(LocalBounds(m_scissor_state), m_viewport_height);
+			SetTexCoordLimits(dataPtr->texcoord_min, dataPtr->texcoord_max, LocalBounds(m_scissor_state), {primary.width, primary.height});
 
 			// Upload to the GPU.
 			m_d3d_context->Unmap(m_drop_shadow_cbuffer, 0);
@@ -2977,8 +3243,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			}
 
 			UseProgram(ProgramId::Passthrough);
-			Gfx::BindRenderTarget(m_d3d_context, secondary);
-			Gfx::BindTexture(m_d3d_context, primary);
+			BindTarget(secondary);
+			BindTexture(primary);
 			SetBlendState(blend_state_backup);
 			DrawFullscreenQuad();
 
@@ -2998,8 +3264,8 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 
 			const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
 			const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
-			Gfx::BindRenderTarget(m_d3d_context, destination);
-			Gfx::BindTexture(m_d3d_context, source);
+			BindTarget(destination);
+			BindTexture(source);
 
 			D3D11_MAPPED_SUBRESOURCE mappedResource{};
 			// Lock the constant buffer so it can be written to.
@@ -3052,12 +3318,21 @@ void RenderInterface_DX11::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 			DisableBlend();
 
 			const Gfx::RenderTargetData& source = m_render_layers->GetPostprocessPrimary();
-			const Gfx::RenderTargetData& blend_mask = m_render_layers->GetBlendMask();
+			const Gfx::RenderTargetData& blend_mask = *filter.mask;
+			D3D11_MAPPED_SUBRESOURCE mapping{};
+			if (FAILED(m_d3d_context->Map(m_drop_shadow_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping)))
+				return;
+			const auto offset = m_target_origin - filter.mask_bounds.p0;
+			const float values[8] = {float(offset.x), float(offset.y), 1.f / blend_mask.width, 1.f / blend_mask.height,
+				float(filter.mask_bounds.Width()) / blend_mask.width, float(filter.mask_bounds.Height()) / blend_mask.height, 0, 0};
+			memcpy(mapping.pData, values, sizeof(values));
+			m_d3d_context->Unmap(m_drop_shadow_cbuffer, 0);
+			m_d3d_context->PSSetConstantBuffers(1, 1, &m_drop_shadow_cbuffer);
 			const Gfx::RenderTargetData& destination = m_render_layers->GetPostprocessSecondary();
 
-			Gfx::BindRenderTarget(m_d3d_context, destination);
-			Gfx::BindTexture(m_d3d_context, source, 0);
-			Gfx::BindTexture(m_d3d_context, blend_mask, 1);
+			BindTarget(destination);
+			BindTexture(source, 0);
+			BindTexture(blend_mask, 1);
 
 			DrawFullscreenQuad();
 
@@ -3131,7 +3406,7 @@ void RenderInterface_DX11::EnableClipMask(bool enable)
 	}
 }
 
-void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation)
+void RenderInterface_DX11::DrawClip(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation)
 {
 	RMLUI_ASSERT(m_is_stencil_enabled);
 	using Rml::ClipMaskOperation;
@@ -3165,7 +3440,6 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 	float blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 	m_d3d_context->OMSetBlendState(m_blend_state_disable_color, blendFactor, 0xffffffff);
 
-	Gfx::BindRenderTarget(m_d3d_context, m_render_layers->GetTopLayer());
 	m_d3d_context->OMSetDepthStencilState(stencil_state, 1);
 
 	bool clear_stencil = (operation == ClipMaskOperation::Set || operation == ClipMaskOperation::SetInverse);
@@ -3174,7 +3448,13 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 		// Clear stencil buffer
 		Rml::LayerHandle layer_handle = m_render_layers->GetTopLayerHandle();
 		const Gfx::RenderTargetData& rtData = m_render_layers->GetLayer(layer_handle);
-		m_d3d_context->ClearDepthStencilView(rtData.depth_stencil_view, D3D11_CLEAR_STENCIL, 1.0f, 0);
+		ID3D11DepthStencilView* depth = nullptr;
+		m_d3d_context->OMGetRenderTargets(0, nullptr, &depth);
+		if (depth)
+		{
+			m_d3d_context->ClearDepthStencilView(depth, D3D11_CLEAR_STENCIL, 1, 0);
+			depth->Release();
+		}
 	}
 
 	RenderGeometry(geometry, translation, {});
@@ -3186,23 +3466,77 @@ void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rm
 	m_d3d_context->OMSetDepthStencilState(m_depth_stencil_state_stencil_test, m_stencil_ref_value);
 }
 
+void RenderInterface_DX11::EnsureClip(const Gfx::RenderTargetData& target)
+{
+	if (!m_is_stencil_enabled || m_drawing_clip || !target.stencil)
+		return;
+	auto& stencil = *target.stencil;
+	if (stencil.generation == m_clip_generation && stencil.origin == target.bounds.p0 && stencil.size == target.bounds.Size())
+		return;
+	const auto transform = m_user_transform;
+	const auto scissor = m_scissor_state;
+	m_drawing_clip = true;
+	m_stencil_ref_value = 0;
+	for (const auto& command : m_clip_commands)
+	{
+		SetTransform(&command.transform);
+		SetScissor(command.scissor);
+		DX11_GeometryData geometry{command.vertices.Get(), command.indices.Get(), command.index_count};
+		DrawClip(command.operation, reinterpret_cast<Rml::CompiledGeometryHandle>(&geometry), command.translation);
+	}
+	SetTransform(&transform);
+	SetScissor(scissor);
+	m_drawing_clip = false;
+	stencil.generation = m_clip_generation;
+	stencil.origin = target.bounds.p0;
+	stencil.size = target.bounds.Size();
+	m_d3d_context->OMSetDepthStencilState(m_depth_stencil_state_stencil_test, m_stencil_ref_value);
+}
+
+void RenderInterface_DX11::RenderToClipMask(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle handle, Rml::Vector2f translation)
+{
+	if (operation == Rml::ClipMaskOperation::Intersect)
+		EnsureClip(m_render_layers->GetTopLayer());
+	else
+		m_clip_commands.clear();
+	const auto& geometry = *reinterpret_cast<DX11_GeometryData*>(handle);
+	ClipCommand command{operation, geometry.vertex_buffer, geometry.index_buffer, geometry.index_count, m_user_transform, translation,
+		m_scissor_state};
+	m_clip_commands.push_back(std::move(command));
+	++m_clip_generation;
+	m_drawing_clip = true;
+	DrawClip(operation, handle, translation);
+	m_drawing_clip = false;
+	if (auto stencil = m_render_layers->GetTopLayer().stencil)
+	{
+		stencil->generation = m_clip_generation;
+		stencil->origin = m_target_origin;
+		stencil->size = m_render_layers->GetTopLayer().bounds.Size();
+	}
+}
+
 struct RenderInterface_DX11::SurfaceTarget
 {
-	RenderLayerStack layers;
+	Gfx::RenderTargetData color;
+	~SurfaceTarget() { Gfx::DestroyRenderTarget(color); }
 };
 
 RenderInterface_DX11::SurfaceTarget* RenderInterface_DX11::CreateSurfaceTarget()
 {
-	auto target = new SurfaceTarget;
-	target->layers.SetD3DResources(m_d3d_device);
-	return target;
+	return new SurfaceTarget;
 }
 
 void RenderInterface_DX11::ReleaseSurfaceTarget(SurfaceTarget* target) { delete target; }
+void RenderInterface_DX11::ResetSurfaceScratch()
+{
+	m_surface_render_layers.Reset();
+	m_mask_pool.clear();
+}
 
 void RenderInterface_DX11::SetSurfaceTarget(SurfaceTarget* target)
 {
-	m_render_layers = target ? &target->layers : &m_default_render_layers;
+	m_surface_target = target;
+	m_render_layers = target ? &m_surface_render_layers : &m_default_render_layers;
 }
 
 ID3D11RenderTargetView* RenderInterface_DX11::GetCurrentRenderTarget() const
@@ -3217,14 +3551,25 @@ ID3D11ShaderResourceView* RenderInterface_DX11::GetCurrentLayerView() const
 
 ID3D11ShaderResourceView* RenderInterface_DX11::EndFrameTexture(ID3D11ShaderResourceView* foreground)
 {
+	m_render_layers->SelectPostprocess(0);
 	const auto& active = m_render_layers->GetTopLayer();
-	const auto& resolved = m_render_layers->GetPostprocessPrimary();
+	if (m_surface_target && (m_surface_target->color.width != m_canvas_width || m_surface_target->color.height != m_canvas_height))
+	{
+		Gfx::DestroyRenderTarget(m_surface_target->color);
+		if (!Gfx::CreateRenderTarget(m_d3d_device, m_surface_target->color, m_canvas_width, m_canvas_height, 0, Gfx::RenderTargetAttachment::None,
+				nullptr))
+		{
+			FinishFrame();
+			return nullptr;
+		}
+	}
+	const auto& resolved = m_surface_target ? m_surface_target->color : m_render_layers->GetResolveTarget(active);
 	if (foreground && SupportsForegroundCache())
 	{
 		ID3D11ShaderResourceView* null_views[2] = {};
 		m_d3d_context->PSSetShaderResources(0, 2, null_views);
-		Gfx::BindRenderTarget(m_d3d_context, resolved);
-		Gfx::BindTexture(m_d3d_context, active);
+		BindTarget(resolved);
+		BindTexture(active);
 		m_d3d_context->PSSetShaderResources(1, 1, &foreground);
 		EnableClipMask(false);
 		SetScissor(Rml::Rectanglei::MakeInvalid());
@@ -3233,8 +3578,16 @@ ID3D11ShaderResourceView* RenderInterface_DX11::EndFrameTexture(ID3D11ShaderReso
 		DrawFullscreenQuad();
 		m_d3d_context->PSSetShaderResources(0, 2, null_views);
 	}
+	else if (active.width == resolved.width && active.height == resolved.height)
+		m_d3d_context->ResolveSubresource(resolved.render_target_texture, 0, active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
 	else
-	m_d3d_context->ResolveSubresource(resolved.render_target_texture, 0, active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+	{
+		const auto& scratch = m_render_layers->GetResolveTarget(active);
+		m_d3d_context->ResolveSubresource(scratch.render_target_texture, 0, active.render_target_texture, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+		D3D11_BOX box{0, 0, 0, UINT(resolved.width), UINT(resolved.height), 1};
+		m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
+		m_d3d_context->CopySubresourceRegion(resolved.render_target_texture, 0, 0, 0, 0, scratch.render_target_texture, 0, &box);
+	}
 	auto view = resolved.render_target_shader_resource_view;
 	FinishFrame();
 	return view;
@@ -3259,16 +3612,13 @@ ID3D11ShaderResourceView* RenderInterface_DX11::SaveCurrentLayerMsaa()
 	{
 		m_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
 		m_d3d_context->CopyResource(snapshot, source.render_target_texture);
-		Gfx::BindRenderTarget(m_d3d_context, source);
+		BindTarget(source);
 	}
 	snapshot->Release();
 	return view;
 }
 
-RenderInterface_DX11::RenderLayerStack::RenderLayerStack()
-{
-	m_rt_postprocess.resize(5);
-}
+RenderInterface_DX11::RenderLayerStack::RenderLayerStack() {}
 
 RenderInterface_DX11::RenderLayerStack::~RenderLayerStack()
 {
@@ -3281,21 +3631,38 @@ void RenderInterface_DX11::RenderLayerStack::SetD3DResources(ID3D11Device* devic
 	m_d3d_device = device;
 }
 
-Rml::LayerHandle RenderInterface_DX11::RenderLayerStack::PushLayer()
+Rml::LayerHandle RenderInterface_DX11::RenderLayerStack::PushLayer(Rml::Rectanglei bounds)
 {
-	RMLUI_ASSERT(m_layers_size <= (int)m_rt_layers.size());
-
-	if (m_layers_size == (int)m_rt_layers.size())
+	if (!bounds.Valid())
+		bounds = Rml::Rectanglei::FromSize({m_width, m_height});
+	bounds = Rml::Rectanglei::FromPositionSize(bounds.p0, Rml::Math::Max(bounds.Size(), Rml::Vector2i(1)));
+	if (m_layers_size == int(m_rt_layers.size()))
 	{
-		// All framebuffers should share a single stencil buffer.
-		ID3D11DepthStencilView* shared_depth_stencil = (m_rt_layers.empty() ? nullptr : m_rt_layers.front().depth_stencil_view);
-
-		m_rt_layers.push_back(Gfx::RenderTargetData{});
-		Gfx::CreateRenderTarget(m_d3d_device, m_rt_layers.back(), m_width, m_height, MsaaSamples, Gfx::RenderTargetAttachment::DepthStencil,
-			shared_depth_stencil);
+		m_rt_layers.emplace_back();
+		m_rt_postprocess.emplace_back(6);
+		m_postprocess_bounds.emplace_back();
+		m_postprocess_capacity.emplace_back();
 	}
-
-	m_layers_size += 1;
+	auto& layer = m_rt_layers[m_layers_size];
+	const int width = Rml::Math::Max(1, Rml::Math::Max(layer.width, bounds.Width()));
+	const int height = Rml::Math::Max(1, Rml::Math::Max(layer.height, bounds.Height()));
+	if (!layer.render_target_view || layer.width != width || layer.height != height)
+	{
+		Gfx::DestroyRenderTarget(layer);
+		const Gfx::RenderTargetData* shared = nullptr;
+		for (const auto& other : m_rt_layers)
+			if (&other != &layer && other.width == width && other.height == height && other.depth_stencil_view)
+			{
+				shared = &other;
+				break;
+			}
+		Gfx::CreateRenderTarget(m_d3d_device, layer, width, height, MsaaSamples, Gfx::RenderTargetAttachment::DepthStencil,
+			shared ? shared->depth_stencil_view : nullptr);
+		if (shared)
+			layer.stencil = shared->stencil;
+	}
+	layer.bounds = bounds;
+	++m_layers_size;
 	return GetTopLayerHandle();
 }
 
@@ -3324,21 +3691,15 @@ Rml::LayerHandle RenderInterface_DX11::RenderLayerStack::GetTopLayerHandle() con
 
 void RenderInterface_DX11::RenderLayerStack::SwapPostprocessPrimarySecondary()
 {
-	std::swap(m_rt_postprocess[0], m_rt_postprocess[1]);
+	std::swap(m_rt_postprocess[m_postprocess_layer][0], m_rt_postprocess[m_postprocess_layer][1]);
 }
 
 void RenderInterface_DX11::RenderLayerStack::BeginFrame(int new_width, int new_height)
 {
 	RMLUI_ASSERT(m_layers_size == 0);
-
-	if (new_width != m_width || new_height != m_height)
-	{
-		m_width = new_width;
-		m_height = new_height;
-
-		DestroyRenderTargets();
-	}
-
+	m_width = new_width;
+	m_height = new_height;
+	m_postprocess_layer = 0;
 	PushLayer();
 }
 
@@ -3357,15 +3718,68 @@ void RenderInterface_DX11::RenderLayerStack::DestroyRenderTargets()
 
 	m_rt_layers.clear();
 
-	for (Gfx::RenderTargetData& fb : m_rt_postprocess)
-		Gfx::DestroyRenderTarget(fb);
+	for (auto& level : m_rt_postprocess)
+		for (auto& fb : level)
+			Gfx::DestroyRenderTarget(fb);
+	m_rt_postprocess.clear();
+	m_postprocess_bounds.clear();
+	m_postprocess_capacity.clear();
+}
+
+void RenderInterface_DX11::RenderLayerStack::SelectPostprocess(Rml::LayerHandle layer)
+{
+	m_postprocess_layer = int(layer);
+}
+
+void RenderInterface_DX11::RenderLayerStack::SetPostprocessBounds(Rml::Rectanglei bounds, int alignment)
+{
+	const auto& layer = m_rt_layers[m_postprocess_layer];
+	const auto canvas = Rml::Rectanglei::FromSize({m_width, m_height});
+	if (alignment && bounds.Valid())
+	{
+		bounds = bounds.Extend(2);
+		if (!canvas.Contains(bounds.p0) || !canvas.Contains(bounds.p1))
+			bounds = canvas;
+		else
+		{
+			const Rml::Vector2i origin{int(std::floor(double(bounds.Left()) / alignment)) * alignment,
+				int(std::floor(double(bounds.Top() - m_height) / alignment)) * alignment + m_height};
+			auto size = bounds.p1 - origin;
+			size = ((size + Rml::Vector2i(alignment - 1)) / alignment) * alignment;
+			bounds = Rml::Rectanglei::FromPositionSize(origin, size);
+			if (!canvas.Contains(bounds.p0) || !canvas.Contains(bounds.p1))
+				bounds = canvas;
+		}
+	}
+	else
+		bounds = layer.bounds;
+	bounds = Rml::Rectanglei::FromPositionSize(bounds.p0, Rml::Math::Max(bounds.Size(), Rml::Vector2i(1)));
+	auto& capacity = m_postprocess_capacity[m_postprocess_layer];
+	capacity = Rml::Math::Max(capacity, bounds.Size());
+	m_postprocess_bounds[m_postprocess_layer] = bounds;
 }
 
 const Gfx::RenderTargetData& RenderInterface_DX11::RenderLayerStack::EnsureRenderTargetPostprocess(int index)
 {
-	RMLUI_ASSERT(index < (int)m_rt_postprocess.size())
-	Gfx::RenderTargetData& rt = m_rt_postprocess[index];
-	if (!rt.render_target_view)
-		Gfx::CreateRenderTarget(m_d3d_device, rt, m_width, m_height, 0, Gfx::RenderTargetAttachment::None, nullptr);
+	const auto size = m_postprocess_capacity[m_postprocess_layer];
+	auto& rt = m_rt_postprocess[m_postprocess_layer][index];
+	if (rt.width != size.x || rt.height != size.y)
+	{
+		Gfx::DestroyRenderTarget(rt);
+		Gfx::CreateRenderTarget(m_d3d_device, rt, size.x, size.y, 0, Gfx::RenderTargetAttachment::None, nullptr);
+	}
+	rt.bounds = m_postprocess_bounds[m_postprocess_layer];
+	return rt;
+}
+
+const Gfx::RenderTargetData& RenderInterface_DX11::RenderLayerStack::GetResolveTarget(const Gfx::RenderTargetData& source)
+{
+	auto& rt = m_rt_postprocess[m_postprocess_layer][5];
+	if (rt.width != source.width || rt.height != source.height)
+	{
+		Gfx::DestroyRenderTarget(rt);
+		Gfx::CreateRenderTarget(m_d3d_device, rt, source.width, source.height, 0, Gfx::RenderTargetAttachment::None, nullptr);
+	}
+	rt.bounds = source.bounds;
 	return rt;
 }

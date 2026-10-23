@@ -6,6 +6,7 @@
 #include "Header.h"
 #include "ObserverPtr.h"
 #include "Property.h"
+#include "Rectangle.h"
 #include "RenderBox.h"
 #include "ScriptInterface.h"
 #include "ScrollTypes.h"
@@ -56,6 +57,8 @@ public:
 	/// Isolate this subtree for an application render surface. Zero restores ordinary rendering.
 	void SetRenderSurface(uintptr_t id);
 	uintptr_t GetRenderSurface() const { return render_surface; }
+	/// Route this world-bound subtree independently of surface capture and depth testing.
+	void SetWorldRenderRoot(bool enabled) { world_render_root = enabled; }
 
 	/// Clones this element, returning a new, unparented element.
 	ElementPtr Clone() const;
@@ -599,6 +602,7 @@ public:
 	virtual void GetTextureSources(StringList& sources);
 
 protected:
+	friend class ElementEffects;
 	void Update(float dp_ratio, Vector2f vp_dimensions);
 	void Render();
 	Rectanglef GetRenderSurfaceBounds();
@@ -719,6 +723,11 @@ private:
 	bool local_stacking_context_forced;
 	bool stacking_context_dirty;
 	uintptr_t render_surface = 0;
+	uint64_t paint_bounds_generation = uint64_t(-1);
+	Rectanglef paint_bounds_cache = Rectanglef::MakeInvalid();
+	bool world_render_root = false;
+	bool render_pass_locked = false;
+	RenderPass render_pass = RenderPass::Screen;
 	bool computed_values_are_default_initialized;
 
 	bool visible; // True if the element is visible and active.

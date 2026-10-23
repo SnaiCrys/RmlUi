@@ -93,6 +93,9 @@ public:
 	/// multiplication with the transform.
 	/// @note The transform applies to all functions that render with a geometry handle, and only those.
 	virtual void SetTransform(const Matrix4f* transform);
+	/// Select an application render pass. RmlUi resends inherited state after switching.
+	/// Effect groups retain one pass; the default implementation renders everything together.
+	virtual void SetRenderPass(RenderPass pass);
 
 	/// Optional isolated subtree capture. Default retains normal rendering; Skip omits the subtree.
 	virtual SurfaceRenderMode BeginRenderSurface(uintptr_t id, Rectanglef border_box, Rectanglei paint_bounds);
@@ -108,6 +111,9 @@ public:
 	/// @return An application-specified handle representing the new layer. The value 'zero' is reserved for the initial base layer.
 	/// @note The new layer should be initialized to transparent black within the current scissor region.
 	virtual LayerHandle PushLayer();
+	/// Conservative paint bounds in document coordinates. Invalid bounds retain the full layer.
+	/// Optional: backends without bounded layers keep their existing implementation.
+	virtual LayerHandle PushLayerWithBounds(Rectanglei bounds);
 	/// Composite two layers with the given blend mode and apply filters.
 	/// @param[in] source The source layer.
 	/// @param[in] destination The destination layer.

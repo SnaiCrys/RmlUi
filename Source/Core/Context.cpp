@@ -238,6 +238,7 @@ bool Context::Render()
 	RMLUI_ZoneScoped;
 
 	render_manager->PrepareRender(dimensions);
+	render_manager->SetRenderPass(RenderPass::Screen);
 
 	root->Render();
 
@@ -250,6 +251,7 @@ bool Context::Render()
 		cursor_proxy->Render();
 	}
 
+	render_manager->SetRenderPass(RenderPass::Screen);
 	render_manager->ResetState();
 
 	return true;

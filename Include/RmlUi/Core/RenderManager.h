@@ -61,6 +61,7 @@ public:
 	void SetClipMask(ClipMaskOperation operation, Geometry* geometry, Vector2f translation);
 
 	void SetTransform(const Matrix4f* new_transform);
+	void SetRenderPass(RenderPass pass);
 
 	// Retrieves the cached render state. If setting this state again, ensure the lifetimes of referenced objects are
 	// still valid. Possibly invalidating actions include destroying an element, or altering its transform property.
@@ -83,6 +84,8 @@ public:
 	CompiledShader CompileShader(const String& name, const Dictionary& parameters);
 
 	LayerHandle PushLayer();
+	LayerHandle PushLayerWithBounds(Rectanglei bounds);
+	uint64_t GetRenderGeneration() const { return render_generation; }
 	void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters);
 	bool SupportsCompositeLayersWithInputBounds() const;
 	void CompositeLayersWithInputBounds(LayerHandle source, LayerHandle destination, BlendMode blend_mode,
@@ -95,6 +98,8 @@ public:
 	CompiledFilter SaveLayerAsMaskImage();
 
 private:
+	RenderPass render_pass = RenderPass::Screen;
+	uint64_t render_generation = 0;
 	void ApplyClipMask(const ClipMaskGeometryList& clip_elements);
 
 	StableVectorIndex InsertGeometry(Mesh&& mesh);

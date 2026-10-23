@@ -11,6 +11,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_3.h>
 #include <vector>
+#include <wrl/client.h>
 
 #ifdef RMLUI_DEBUG
 	#define RMLUI_DX_ASSERTMSG(statement, msg) RMLUI_ASSERTMSG(SUCCEEDED(statement), msg)
@@ -55,8 +56,9 @@ public:
 	struct SurfaceTarget;
 	SurfaceTarget* CreateSurfaceTarget();
 	void ReleaseSurfaceTarget(SurfaceTarget* target);
-	// Select outside BeginFrame/EndFrame. Targets retain their private stencil and scratch layers.
+	// Select outside BeginFrame/EndFrame. Targets own resolved color; working layers are shared.
 	void SetSurfaceTarget(SurfaceTarget* target);
+	void ResetSurfaceScratch();
 	ID3D11ShaderResourceView* EndFrameTexture(ID3D11ShaderResourceView* foreground = nullptr);
 	bool SupportsForegroundCache() const;
 	// Returns an owned MSAA color snapshot, without retaining stencil or scratch targets.
@@ -67,6 +69,8 @@ public:
 	void SetBackdropTexture(ID3D11ShaderResourceView* view) { m_backdrop_texture = view; }
 	void BeginBackdropFilter() override { m_backdrop_active = true; }
 	void EndBackdropFilter() override { m_backdrop_active = false; }
+	void BeginTextureGeneration() override;
+	void EndTextureGeneration() override;
 
 	// -- Inherited from Rml::RenderInterface --
 
@@ -87,6 +91,7 @@ public:
 	void SetTransform(const Rml::Matrix4f* transform) override;
 
 	Rml::LayerHandle PushLayer() override;
+	Rml::LayerHandle PushLayerWithBounds(Rml::Rectanglei bounds) override;
 	void CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
 		Rml::Span<const Rml::CompiledFilterHandle> filters) override;
 	bool SupportsCompositeLayersWithInputBounds() const override;
@@ -114,6 +119,31 @@ public:
 	static constexpr Rml::TextureHandle TexturePostprocessNoBinding = Rml::TextureHandle(-3);
 
 private:
+	void BindTarget(const Gfx::RenderTargetData& target, bool update_space = true);
+	void BindTexture(const Gfx::RenderTargetData& texture, uint32_t slot = 0, bool logical_uv = true);
+	void SetTargetSpace(int width, int height, Rml::Vector2i origin, bool is_layer);
+	void DrawTargetQuad(const Gfx::RenderTargetData& source, const Gfx::RenderTargetData& destination);
+	Rml::Rectanglei LocalBounds(Rml::Rectanglei bounds) const;
+	void SetLocalScissor(Rml::Rectanglei region, bool vertically_flip = false);
+	void EnsureClip(const Gfx::RenderTargetData& target);
+	void DrawClip(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation);
+	struct ClipCommand {
+		Rml::ClipMaskOperation operation;
+		Microsoft::WRL::ComPtr<ID3D11Buffer> vertices, indices;
+		size_t index_count;
+		Rml::Matrix4f transform;
+		Rml::Vector2f translation;
+		Rml::Rectanglei scissor;
+	};
+	std::vector<ClipCommand> m_clip_commands;
+	uint64_t m_clip_generation = 0;
+	bool m_drawing_clip = false, m_scissor_binding_dirty = true;
+	bool m_target_is_layer = false;
+	unsigned m_texture_generation_depth = 0;
+	Rml::Vector2i m_target_origin = {};
+	int m_canvas_width = 0, m_canvas_height = 0;
+	Rml::Matrix4f m_user_transform = Rml::Matrix4f::Identity();
+	std::vector<Rml::SharedPtr<Gfx::RenderTargetData>> m_mask_pool;
 	bool m_valid = false;
 	Rml::Rectanglei RasterBounds(Rml::Rectanglei bounds) const;
 	Rml::Vector2f m_raster_scale = {1, 1};
@@ -129,7 +159,7 @@ private:
 	// Coordinates are in pixels.
 	void BlitRenderTarget(const Gfx::RenderTargetData& source, const Gfx::RenderTargetData& dest, int srcX0, int srcY0, int srcX1, int srcY1,
 		int dstX0, int dstY0, int dstX1, int dstY1);
-	void BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional = false);
+	void BlitLayerToPostprocessPrimary(Rml::LayerHandle layer_handle, bool allow_regional = false, bool preserve_space = false);
 	void RenderFilters(Rml::Span<const Rml::CompiledFilterHandle> filter_handles);
 	void CompositeLayersInternal(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
 		Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_bounds);
@@ -164,6 +194,9 @@ private:
 	ID3D11Buffer* m_color_matrix_cbuffer = nullptr;
 	ID3D11Buffer* m_blur_cbuffer = nullptr;
 	ID3D11Buffer* m_drop_shadow_cbuffer = nullptr;
+	ID3D11Buffer* m_sampling_cbuffer = nullptr;
+	float m_sampling_values[8] = {};
+	bool m_sampling_initialized = false;
 	bool m_cbuffer_dirty = true;
 	ID3D11SamplerState* m_sampler_state = nullptr;
 	ID3D11SamplerState* m_postprocess_sampler_state = nullptr;
@@ -183,7 +216,7 @@ private:
 
 	ProgramId active_program = {};
 	Rml::Rectanglei m_scissor_state = Rml::Rectanglei::MakeInvalid();
-	Rml::UniquePtr<const Gfx::ProgramData> program_data;
+	Rml::SharedPtr<const Gfx::ProgramData> program_data;
 
 	struct DX11_GeometryData {
 	public:
@@ -217,6 +250,7 @@ private:
 		ID3D11ClassInstance *pixel_shader_instances[256], *vertex_shader_instances[256], *geometry_shader_instances[256];
 		D3D11_PRIMITIVE_TOPOLOGY primitive_topology;
 		ID3D11Buffer *index_buffer, *vertex_buffer, *vertex_shader_constant_buffer;
+		ID3D11Buffer *vertex_sampling_buffer = nullptr, *pixel_sampling_buffer = nullptr;
 		UINT index_buffer_offset, vertex_buffer_stride, vertex_buffer_offset;
 		DXGI_FORMAT index_buffer_format;
 		ID3D11InputLayout* input_layout;
@@ -284,7 +318,11 @@ private:
 		void SetD3DResources(ID3D11Device* device);
 
 		// Push a new layer. All references to previously retrieved layers are invalidated.
-		Rml::LayerHandle PushLayer();
+		Rml::LayerHandle PushLayer(Rml::Rectanglei bounds = Rml::Rectanglei::MakeInvalid());
+		void SelectPostprocess(Rml::LayerHandle layer);
+		void SetPostprocessBounds(Rml::Rectanglei bounds, int alignment);
+		const Gfx::RenderTargetData& GetResolveTarget(const Gfx::RenderTargetData& source);
+		void Reset() { DestroyRenderTargets(); }
 
 		// Pop the top layer. All references to previously retrieved layers are invalidated.
 		void PopLayer();
@@ -314,12 +352,17 @@ private:
 		int m_layers_size = 0;
 
 		Rml::Vector<Gfx::RenderTargetData> m_rt_layers;
-		Rml::Vector<Gfx::RenderTargetData> m_rt_postprocess;
+		Rml::Vector<Rml::Vector<Gfx::RenderTargetData>> m_rt_postprocess;
+		Rml::Vector<Rml::Rectanglei> m_postprocess_bounds;
+		Rml::Vector<Rml::Vector2i> m_postprocess_capacity;
+		int m_postprocess_layer = 0;
 
 		ID3D11Device* m_d3d_device = nullptr;
 	};
 
 	RenderLayerStack m_default_render_layers;
+	RenderLayerStack m_surface_render_layers;
+	SurfaceTarget* m_surface_target = nullptr;
 	RenderLayerStack* m_render_layers = &m_default_render_layers;
 	ID3D11ShaderResourceView* m_backdrop_texture = nullptr;
 	bool m_backdrop_active = false;

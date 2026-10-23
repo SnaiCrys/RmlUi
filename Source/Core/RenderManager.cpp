@@ -43,6 +43,7 @@ RenderManager::~RenderManager()
 
 void RenderManager::PrepareRender(Vector2i dimensions)
 {
+	++render_generation;
 #ifdef RMLUI_DEBUG
 	const RenderState default_state;
 	RMLUI_ASSERT(state.clip_mask_list == default_state.clip_mask_list);
@@ -158,6 +159,23 @@ void RenderManager::SetTransform(const Matrix4f* p_new_transform)
 	}
 }
 
+void RenderManager::SetRenderPass(RenderPass next)
+{
+	if (render_pass == next) return;
+	// A filter or mask owns its complete subtree. Never split its layer stack across passes.
+	RMLUI_ASSERTMSG(render_stack.empty(), "Cannot change render pass inside an effect layer");
+	if (!render_stack.empty()) return;
+	const RenderState previous = state;
+	render_interface->SetRenderPass(next);
+	render_pass = next;
+	// Each command list has independent GPU state, possibly left over from an earlier visit.
+	render_interface->EnableScissorRegion(false);
+	render_interface->EnableClipMask(false);
+	render_interface->SetTransform(nullptr);
+	state = {};
+	SetState(previous);
+}
+
 void RenderManager::ApplyClipMask(const ClipMaskGeometryList& clip_elements)
 {
 	const bool clip_mask_enabled = !clip_elements.empty();
@@ -223,13 +241,10 @@ void RenderManager::EndBackdropFilter() { render_interface->EndBackdropFilter();
 void RenderManager::BeginTextureGeneration()
 {
 	render_interface->BeginTextureGeneration();
-	if (surface_clip_bounds.Valid() || !texture_generation_states.empty())
-	{
-		texture_generation_states.push_back({surface_clip_bounds, state});
-		// Callback textures use coordinates relative to their own texture, not the world surface.
-		surface_clip_bounds = Rectanglei::MakeInvalid();
-		ResetState();
-	}
+	texture_generation_states.push_back({surface_clip_bounds, state});
+	// Callback textures have their own state, independent of the first element or pass using them.
+	surface_clip_bounds = Rectanglei::MakeInvalid();
+	ResetState();
 }
 
 void RenderManager::EndTextureGeneration()
@@ -357,6 +372,13 @@ CompiledShader RenderManager::CompileShader(const String& name, const Dictionary
 LayerHandle RenderManager::PushLayer()
 {
 	const LayerHandle layer = render_interface->PushLayer();
+	render_stack.push_back(layer);
+	return layer;
+}
+
+LayerHandle RenderManager::PushLayerWithBounds(Rectanglei bounds)
+{
+	const LayerHandle layer = render_interface->PushLayerWithBounds(bounds);
 	render_stack.push_back(layer);
 	return layer;
 }

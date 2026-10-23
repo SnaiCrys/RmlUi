@@ -257,7 +257,10 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 
 		if (!filters.empty() || !mask_images.empty())
 		{
-			render_manager->PushLayer();
+			auto bounds = element->GetRenderSurfaceBounds();
+			Math::ExpandToPixelGrid(bounds);
+			render_manager->PushLayerWithBounds(
+				bounds.Valid() ? Rectanglei(bounds).Intersect(render_manager->GetRenderBounds()) : Rectanglei::MakeInvalid());
 		}
 
 		if (!backdrop_filters.empty())
@@ -282,7 +285,7 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 			}
 			else
 			{
-				render_manager->PushLayer();
+				render_manager->PushLayerWithBounds(render_manager->GetScissorRegion());
 				const LayerHandle backdrop_temp_layer = render_manager->GetTopLayer();
 				// Render the filters over their input bounds, then apply the output border and clip mask.
 				render_manager->CompositeLayers(backdrop_source_layer, backdrop_temp_layer, BlendMode::Blend, filter_handles);
@@ -309,7 +312,7 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 
 			if (!mask_images.empty())
 			{
-				render_manager->PushLayer();
+				render_manager->PushLayerWithBounds(render_manager->GetScissorRegion());
 
 				for (int i = (int)mask_images.size() - 1; i >= 0; i--)
 				{

@@ -146,6 +146,14 @@ void Element::Update(float dp_ratio, Vector2f vp_dimensions)
 
 	meta->effects.InstanceEffects();
 
+	// Determine ownership during the existing update walk, including flattened stacking children.
+	// An outer filter/mask/backdrop group keeps its original pass and all of its descendants.
+	render_pass = parent ? parent->render_pass : RenderPass::Screen;
+	render_pass_locked = parent && parent->render_pass_locked;
+	if (!render_pass_locked && world_render_root) render_pass = RenderPass::World;
+	const auto& values = GetComputedValues();
+	render_pass_locked |= values.has_filter() || values.has_backdrop_filter() || values.has_mask_image();
+
 	for (size_t i = 0; i < children.size(); i++)
 		children[i]->Update(dp_ratio, vp_dimensions);
 
@@ -197,6 +205,7 @@ void Element::Render()
 		BuildLocalStackingContext();
 
 	UpdateTransformState();
+	if (auto manager = GetRenderManager()) manager->SetRenderPass(render_pass);
 	RenderManager* surface_manager = (render_surface ? GetRenderManager() : nullptr);
 	RenderState previous_surface_state;
 	bool captured_surface = false;
@@ -228,6 +237,7 @@ void Element::Render()
 	for (Element* element : stacking_context)
 		element->Render();
 
+	if (auto manager = GetRenderManager()) manager->SetRenderPass(render_pass);
 	ElementUtilities::ApplyTransform(*this);
 	meta->effects.RenderEffects(RenderStage::Exit);
 	if (captured_surface) surface_manager->EndRenderSurface(previous_surface_state);
@@ -248,6 +258,10 @@ void Element::SetRenderSurface(uintptr_t id)
 
 Rectanglef Element::GetRenderSurfaceBounds()
 {
+	const auto manager = GetRenderManager();
+	const auto generation = manager ? manager->GetRenderGeneration() : uint64_t(-1);
+	if (manager && paint_bounds_generation == generation)
+		return paint_bounds_cache;
 	UpdateAbsoluteOffsetAndRenderBoxData();
 	UpdateTransformState();
 	Rectanglef bounds = Rectanglef::MakeInvalid();
@@ -257,6 +271,8 @@ Rectanglef Element::GetRenderSurfaceBounds()
 		if (child->IsVisible()) bounds = bounds.Join(child->GetRenderSurfaceBounds());
 	}
 	meta->effects.ExtendSurfaceInkOverflow(bounds);
+	paint_bounds_generation = generation;
+	paint_bounds_cache = bounds;
 	return bounds;
 }
 
